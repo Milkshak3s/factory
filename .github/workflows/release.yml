@@ -1,0 +1,70 @@
+# Builds the MSI and leaves it on a draft release. The pipeline pushes to `release`, waits for this
+# workflow, then sets the notes and publishes the draft.
+name: Release
+
+on:
+  push:
+    branches: [release]
+
+permissions:
+  contents: write
+
+env:
+  WIX_VERSION: 6.0.2
+  # Lets the pinned WiX tool run on whichever newer .NET runtime the runner has.
+  DOTNET_ROLL_FORWARD: Major
+
+jobs:
+  msi:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      # Each step below ends in the native command that matters, so its exit code fails the step.
+      - name: Update Rust
+        run: rustup update stable --no-self-update
+
+      - name: Use stable Rust
+        run: rustup default stable
+
+      - name: Read the version
+        id: version
+        run: |
+          $version = (cargo metadata --no-deps --locked --format-version 1 | ConvertFrom-Json).packages[0].version
+          if (-not $version) { throw 'Could not read the version from Cargo.toml' }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Install WiX
+        run: |
+          Add-Content -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.dotnet\tools"
+          dotnet tool install --global wix --version $env:WIX_VERSION
+
+      - name: Build the MSI
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $version = $env:VERSION
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          wix build wix/main.wxs -arch x64 -d "Version=$version" -d "ExePath=target\release\factory.exe" -o "dist\factory-$version-x64.msi"
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $version = $env:VERSION
+          $msi = "dist\factory-$version-x64.msi"
+          if (-not (Test-Path -LiteralPath $msi) -or (Get-Item -LiteralPath $msi).Length -eq 0) {
+            throw "$msi was not produced"
+          }
+          gh release create "v$version" $msi --draft --target $env:GITHUB_SHA --title "factory v$version" --notes "Release notes pending."

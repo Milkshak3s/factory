@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  A per-user MSI: no UAC prompt, so the app can update itself in one click.
+  Built by .github/workflows/release.yml, which passes in Version and ExePath.
+  Uninstalling only removes what's listed here, so %APPDATA%\factory and %LOCALAPPDATA%\factory stay.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="Factory"
+    Manufacturer="Milkshak3s"
+    Version="$(var.Version)"
+    UpgradeCode="7B3E4F0A-9C1D-4E52-A6B8-2D5F1C8E7A34"
+    Scope="perUser"
+    Compressed="yes">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Factory is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="Factory">
+          <!-- Per-user components need an HKCU key path, not a file. -->
+          <Component Id="FactoryExe" Guid="4D1A6C52-8E37-4B09-9F21-6A7C3E05B1D8">
+            <File Id="FactoryExeFile" Name="factory.exe" Source="$(var.ExePath)" KeyPath="no" />
+            <RegistryValue Root="HKCU" Key="Software\Factory" Name="Installed" Type="integer" Value="1" KeyPath="yes" />
+            <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+            <RemoveFolder Id="RemoveProgramsFolder" Directory="ProgramsFolder" On="uninstall" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut" Guid="E92F07B4-3C68-4A1D-B5E3-1F84D7A0C926">
+        <Shortcut Id="FactoryShortcut" Name="Factory" Target="[INSTALLFOLDER]factory.exe" WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKCU" Key="Software\Factory" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <Feature Id="Main">
+      <ComponentRef Id="FactoryExe" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+  </Package>
+</Wix>

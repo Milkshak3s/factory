@@ -7,6 +7,7 @@ mod forge;
 mod git;
 mod pipeline;
 mod proc;
+mod update;
 mod version;
 
 fn main() -> eframe::Result {

@@ -15,6 +15,7 @@ use crate::forge::{Forge, GhCli, locate_gh};
 use crate::git::{self, RepoStatus};
 use crate::pipeline::{self, Env, GrillReply, Question, RunKind, RunRecord, RunState, RunStatus, Stage, StageStatus};
 use crate::proc::{Cancel, command};
+use crate::update::{self, Step, Updater};
 use crate::version::Bump;
 
 const REFRESH_EVERY: Duration = Duration::from_secs(30);
@@ -117,6 +118,8 @@ pub struct App {
     release_bump: Option<Bump>,
     notice: Option<String>,
     running_last_frame: usize,
+    /// Only set when running from the MSI's install folder.
+    updater: Option<Updater>,
 }
 
 fn status_color(status: RunStatus) -> Color32 {
@@ -182,6 +185,7 @@ impl App {
             .collect();
         let (status_tx, status_rx) = mpsc::channel();
         let (gh_tx, gh_rx) = mpsc::channel();
+        let updater = Updater::detect(&paths.data_dir);
         Self {
             paths,
             selected: (!config.projects.is_empty()).then_some(0),
@@ -201,7 +205,63 @@ impl App {
             release_bump: None,
             notice,
             running_last_frame: 0,
+            updater,
         }
+    }
+
+    /// The bar across the top of the window, while there's a newer release to install.
+    fn update_bar(&mut self, ui: &mut egui::Ui) {
+        let running = self.running_count();
+        let Some(updater) = &mut self.updater else { return };
+        let Some(available) = updater.available.clone() else { return };
+        egui::Panel::top("update_bar").show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(BLUE, format!("Factory v{} is available", available.version));
+                match updater.step.clone() {
+                    Step::Idle => {
+                        if ui.button("Update now").clicked() {
+                            updater.start_download(ui.ctx());
+                        }
+                    }
+                    Step::Downloading => {
+                        ui.add_enabled(false, egui::Button::new("Downloading…"));
+                    }
+                    Step::Confirm(msi) => {
+                        ui.colored_label(AMBER, update::confirm_text(running));
+                        let label = if running > 0 { "Update anyway" } else { "Update now" };
+                        if ui.button(label).clicked() {
+                            if let Err(error) = updater.install(ui.ctx(), &msi) {
+                                self.notice = Some(error);
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            updater.step = Step::Idle;
+                        }
+                    }
+                    Step::Installing => {
+                        ui.add_enabled(false, egui::Button::new("Installing…"));
+                    }
+                }
+                if !available.url.is_empty() {
+                    ui.hyperlink_to("Release notes", &available.url);
+                }
+            });
+        });
+    }
+
+    /// The row at the bottom of the Projects panel, for the installed app only.
+    fn version_row(&mut self, ui: &mut egui::Ui) {
+        let Some(updater) = &mut self.updater else { return };
+        egui::Panel::bottom("version_row").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.small(format!("Factory v{}", update::CURRENT_VERSION));
+                let checking = updater.is_checking();
+                let label = if checking { "Checking…" } else { "Check for updates" };
+                if ui.add_enabled(!checking, egui::Button::new(label).small()).clicked() {
+                    updater.start_check(ui.ctx(), true);
+                }
+            });
+        });
     }
 
     fn save_config(&mut self) {
@@ -763,6 +823,13 @@ impl eframe::App for App {
         }
         ctx.request_repaint_after(REFRESH_EVERY);
 
+        if let Some(updater) = &mut self.updater {
+            if let Some(notice) = updater.poll(&ctx, running) {
+                self.notice = Some(notice);
+            }
+        }
+        self.update_bar(ui);
+
         if let Some(notice) = self.notice.clone() {
             egui::Panel::bottom("notice").show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -776,7 +843,10 @@ impl eframe::App for App {
 
         egui::Panel::left("projects")
             .default_size(300.0)
-            .show(ui, |ui| self.project_list(ui));
+            .show(ui, |ui| {
+                self.version_row(ui);
+                self.project_list(ui);
+            });
 
         egui::CentralPanel::default().show(ui, |ui| match self.selected {
             Some(index) if index < self.config.projects.len() => self.project_detail(ui, index),

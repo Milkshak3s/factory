@@ -1767,6 +1767,11 @@ mod tests {
     const CARGO_LOCK: &str = "version = 4\n\n[[package]]\nname = \"demo\"\nversion = \"0.3.1\"\n";
     const WORKFLOW: &str = "on:\n  push:\n    branches: [release]\n";
 
+    #[test]
+    fn this_repos_own_release_workflow_is_detected() {
+        assert!(has_release_workflow(Path::new(env!("CARGO_MANIFEST_DIR"))));
+    }
+
     fn ci_project() -> Fixture {
         fixture_with(&[
             ("Makefile", &makefile_requiring("fixed.txt")),

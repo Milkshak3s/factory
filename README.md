@@ -40,6 +40,9 @@ A failure after Merge leaves the merged work on the default branch.
 
 The version comes from `Cargo.toml` or `package.json`, otherwise from the latest tag.
 
+Factory's own releases take the first route: its `.github/workflows/release.yml` builds
+`factory-<version>-x64.msi` with WiX on `windows-latest` and attaches it to the draft.
+
 ## What keeps agents out of the pipeline's steps
 
 - `git commit`, `push`, `tag` and similar are on the build agent's tool denylist.
@@ -56,9 +59,33 @@ The default `acceptEdits` mode still lets the build agent run some shell command
 refused. Add what it needs under *Allowed tools*, such as `Bash(cargo check:*)`, so it can compile
 its own work. `bypassPermissions` removes the limit entirely, so use it with care.
 
+## Install
+
+Download `factory-<version>-x64.msi` from
+[Releases](https://github.com/Milkshak3s/factory/releases) and run it. It installs for your user
+only, needs no admin rights, and adds a Factory shortcut to the Start Menu. The program goes in
+`%LOCALAPPDATA%\Programs\Factory`. Uninstalling leaves your configuration and run history in place.
+
+The MSI isn't code-signed, so a browser download may show a SmartScreen warning.
+
+## Updates
+
+The installed app checks this repo's latest published release at startup and every 30 minutes, or
+when you click *Check for updates* at the bottom of the Projects panel. When a newer version has an
+MSI, a bar appears at the top of the window. *Update now* downloads the MSI, warns you if runs are
+in progress because they'll be stopped, then closes the app, installs the update and relaunches.
+
+- Checks and downloads go through `gh`, so it has to be installed and logged in. A failed background
+  check shows nothing and is retried at the next interval.
+- If the install fails, the current version stays and is relaunched, and the bar comes back at the
+  next check.
+- Source builds such as `cargo run` don't check or update. Only a copy running from the install
+  folder does.
+- Versions from before the first MSI need one manual install.
+
 ## Setup
 
-You need GNU Make, the GitHub CLI and the Claude CLI, the last two logged in. Factory finds `claude`
+To run from source, you need GNU Make, the GitHub CLI and the Claude CLI, the last two logged in. Factory finds `claude`
 on `PATH`, then in the desktop app's install, and that binary needs its own login.
 
 ```bash

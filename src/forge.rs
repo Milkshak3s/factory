@@ -58,7 +58,7 @@ impl GhCli {
         cmd
     }
 
-    fn run(&self, dir: &Path, args: &[&str], input: Option<&str>) -> Result<String, String> {
+    pub(crate) fn run(&self, dir: &Path, args: &[&str], input: Option<&str>) -> Result<String, String> {
         let mut cmd = self.cmd(dir, args);
         cmd.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped())
