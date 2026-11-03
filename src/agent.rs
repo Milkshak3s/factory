@@ -18,8 +18,11 @@ const GRILL_RULES: &str = "You are the requirements step of a software factory. 
 grill the user until the request has narrowed to one specific solution. Nothing has been built \
 yet, and a build agent will work from your brief without being able to ask anything. Read the \
 code first, and never ask what the code already answers. Then ask pointed questions about the \
-behavior, scope, edge cases and tradeoffs that would change what gets built. Name the options you \
-see and say which you'd pick. Always ask at least one round of questions, however clear the \
+behavior, scope, edge cases and tradeoffs that would change what gets built. Any question with \
+discrete choices must give 2-4 short, self-contained options in `options`, and set `recommended` to \
+the zero-based index of the one you'd pick; the explanation and tradeoffs go in `text`. Leave \
+`options` out of open-ended questions. Don't add an 'Other' option, because the user can always type \
+their own answer. Always ask at least one round of questions, however clear the \
 request looks. Ask at most 5 questions per round, and keep going for as many rounds as it takes. \
 Once the user has answered and no question would change the solution, return status \"ready\" with a title \
 (an imperative commit subject of under 60 characters), a brief (the specific solution: what \
@@ -27,7 +30,7 @@ changes, where, how it behaves, what is out of scope, and how to test it), and a
 fixes, minor for new features, major for breaking changes. Otherwise return status \"questions\" \
 with your questions. You can't change any files.";
 
-const GRILL_SCHEMA: &str = r#"{"type":"object","properties":{"status":{"type":"string","enum":["questions","ready"]},"questions":{"type":"array","items":{"type":"string"}},"title":{"type":"string"},"brief":{"type":"string"},"bump":{"type":"string","enum":["patch","minor","major"]}},"required":["status"],"if":{"properties":{"status":{"const":"ready"}}},"then":{"required":["title","brief","bump"]}}"#;
+const GRILL_SCHEMA: &str = r#"{"type":"object","properties":{"status":{"type":"string","enum":["questions","ready"]},"questions":{"type":"array","items":{"type":"object","properties":{"text":{"type":"string"},"options":{"type":"array","items":{"type":"string"}},"recommended":{"type":"integer","minimum":0}},"required":["text"]}},"title":{"type":"string"},"brief":{"type":"string"},"bump":{"type":"string","enum":["patch","minor","major"]}},"required":["status"],"if":{"properties":{"status":{"const":"ready"}}},"then":{"required":["title","brief","bump"]}}"#;
 
 const MAKEFILE_RULES: &str = "You are setting up a software factory's test gate for this project. \
 Read the project, including any CI workflows and scripts, to learn how it is really built and \
@@ -357,6 +360,17 @@ mod tests {
     fn the_grill_schema_is_valid_json() {
         let schema: Value = serde_json::from_str(GRILL_SCHEMA).unwrap();
         assert_eq!(schema["properties"]["bump"]["enum"][1], "minor");
+    }
+
+    #[test]
+    fn grill_questions_require_text_and_can_offer_options_and_a_recommendation() {
+        let schema: Value = serde_json::from_str(GRILL_SCHEMA).unwrap();
+        let items = &schema["properties"]["questions"]["items"];
+        assert_eq!(items["type"], "object");
+        assert_eq!(items["required"], serde_json::json!(["text"]));
+        assert_eq!(items["properties"]["text"]["type"], "string");
+        assert_eq!(items["properties"]["options"]["items"]["type"], "string");
+        assert_eq!(items["properties"]["recommended"]["type"], "integer");
     }
 
     #[test]

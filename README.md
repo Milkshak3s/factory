@@ -13,7 +13,8 @@ Prepare → Grill → Branch → Build ⇄ Test → Commit → Merge → Release
    on, because the run works from `origin` either way. Your unpushed work stays out of the run.
 1. **Grill:** an agent reads the code and questions you, in rounds, until the request has narrowed
    to one specific solution. It can read files but not change anything. *Enough, build it* tells it
-   to settle whatever is left.
+   to settle whatever is left. Questions come with clickable options, the agent's recommendation
+   pre-selected, and an *Other* field for typing an alternative.
 2. **Branch:** a local `factory/<run-id>` branch, in its own git worktree, so several runs can go at
    once and none of them edit your checkout.
 3. **Build:** a fresh agent gets the agreed brief and the Q&A behind it. If tests fail, their output

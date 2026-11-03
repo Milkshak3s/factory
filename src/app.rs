@@ -13,7 +13,7 @@ use crate::agent::{Agent, ClaudeCli, locate_claude};
 use crate::config::{self, Config, Paths, Project};
 use crate::forge::{Forge, GhCli, locate_gh};
 use crate::git::{self, RepoStatus};
-use crate::pipeline::{self, Env, GrillReply, RunKind, RunRecord, RunState, RunStatus, Stage, StageStatus};
+use crate::pipeline::{self, Env, GrillReply, Question, RunKind, RunRecord, RunState, RunStatus, Stage, StageStatus};
 use crate::proc::{Cancel, command};
 use crate::version::Bump;
 
@@ -33,6 +33,68 @@ struct RunEntry {
     replies: Option<Sender<GrillReply>>,
     thread: Option<JoinHandle<()>>,
     log_loaded: bool,
+    /// The user's unsent answers to the questions waiting on this run, one per question.
+    drafts: Vec<QuestionDraft>,
+}
+
+/// One question's answer so far: a picked option or typed text, never both.
+#[derive(Debug, Default, PartialEq)]
+struct QuestionDraft {
+    selected: Option<usize>,
+    other: String,
+}
+
+impl QuestionDraft {
+    fn new(question: &Question) -> Self {
+        QuestionDraft { selected: question.recommended, other: String::new() }
+    }
+
+    fn click_option(&mut self, option: usize) {
+        if self.selected == Some(option) {
+            self.selected = None;
+        } else {
+            self.selected = Some(option);
+            self.other.clear();
+        }
+    }
+
+    /// Call after `other` was edited.
+    fn other_edited(&mut self) {
+        if !self.other.trim().is_empty() {
+            self.selected = None;
+        }
+    }
+
+    fn answer<'a>(&'a self, question: &'a Question) -> Option<&'a str> {
+        let other = self.other.trim();
+        if other.is_empty() {
+            self.selected.and_then(|index| question.options.get(index)).map(String::as_str)
+        } else {
+            Some(other)
+        }
+    }
+}
+
+/// The reply to a round of questions, or `None` if none of them has an answer yet.
+fn build_reply(questions: &[Question], drafts: &[QuestionDraft]) -> Option<String> {
+    let answers: Vec<Option<&str>> = questions.iter().zip(drafts).map(|(question, draft)| draft.answer(question)).collect();
+    if answers.iter().all(Option::is_none) {
+        return None;
+    }
+    let lines: Vec<String> = answers
+        .iter()
+        .enumerate()
+        .map(|(index, answer)| format!("{}. {}", index + 1, answer.unwrap_or("(no answer)")))
+        .collect();
+    Some(lines.join("\n"))
+}
+
+/// What *Enough, build it* sends, given the round's reply so far.
+fn enough_reply(reply: Option<String>) -> GrillReply {
+    match reply {
+        Some(reply) => GrillReply::Answer(format!("{reply}\n\nThat's everything from me: settle anything still open and write the brief.")),
+        None => GrillReply::Proceed,
+    }
 }
 
 pub struct App {
@@ -46,7 +108,6 @@ pub struct App {
     gh_rx: mpsc::Receiver<Result<(), String>>,
     selected: Option<usize>,
     task: String,
-    answer: String,
     statuses: HashMap<PathBuf, RepoStatus>,
     status_tx: Sender<(PathBuf, RepoStatus)>,
     status_rx: mpsc::Receiver<(PathBuf, RepoStatus)>,
@@ -116,6 +177,7 @@ impl App {
                 replies: None,
                 thread: None,
                 log_loaded: false,
+                drafts: Vec::new(),
             })
             .collect();
         let (status_tx, status_rx) = mpsc::channel();
@@ -130,7 +192,6 @@ impl App {
             gh_tx,
             gh_rx,
             task: String::new(),
-            answer: String::new(),
             statuses: HashMap::new(),
             status_tx,
             status_rx,
@@ -213,7 +274,6 @@ impl App {
         };
         let handle = pipeline::start(project, kind, env);
         self.selected_run = Some(handle.state.lock().unwrap().record.id.clone());
-        self.answer.clear();
         self.runs.insert(
             0,
             RunEntry {
@@ -222,6 +282,7 @@ impl App {
                 replies: Some(handle.replies),
                 thread: Some(handle.thread),
                 log_loaded: true,
+                drafts: Vec::new(),
             },
         );
     }
@@ -575,43 +636,36 @@ impl App {
         }
 
         let Some(questions) = &record.questions else { return };
+        let entry = &mut self.runs[position];
+        if entry.drafts.len() != questions.len() {
+            entry.drafts = questions.iter().map(QuestionDraft::new).collect();
+        }
         let mut reply = None;
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.colored_label(AMBER, "The agent needs answers before it can build.");
-            ScrollArea::vertical().id_salt("questions").max_height(220.0).show(ui, |ui| {
-                for (number, question) in questions.iter().enumerate() {
-                    ui.label(format!("{}. {question}", number + 1));
+            ScrollArea::vertical().id_salt(("questions", &record.id)).max_height(360.0).show(ui, |ui| {
+                for (number, (question, draft)) in questions.iter().zip(&mut entry.drafts).enumerate() {
+                    ui.push_id((&record.id, number), |ui| question_input(ui, number, question, draft));
                 }
             });
-            ui.add(
-                TextEdit::multiline(&mut self.answer)
-                    .hint_text("Your answers")
-                    .desired_rows(4)
-                    .desired_width(f32::INFINITY),
-            );
             ui.horizontal(|ui| {
-                let can_send = !self.answer.trim().is_empty();
-                if ui.add_enabled(can_send, egui::Button::new("Send answers")).clicked() {
-                    reply = Some(GrillReply::Answer(self.answer.trim().to_string()));
+                let answers = build_reply(questions, &entry.drafts);
+                if ui.add_enabled(answers.is_some(), egui::Button::new("Send answers")).clicked() {
+                    reply = answers.clone().map(GrillReply::Answer);
                 }
                 let hint = "Have the agent settle whatever is left and write the brief";
                 if ui.button("Enough, build it").on_hover_text(hint).clicked() {
-                    let answer = self.answer.trim();
-                    reply = Some(if answer.is_empty() {
-                        GrillReply::Proceed
-                    } else {
-                        GrillReply::Answer(format!("{answer}\n\nThat's everything from me: settle anything still open and write the brief."))
-                    });
+                    reply = Some(enough_reply(answers));
                 }
             });
         });
         if let Some(reply) = reply {
-            if let Some(replies) = &self.runs[position].replies {
+            if let Some(replies) = &entry.replies {
                 let _ = replies.send(reply);
             }
             // Hide them now, so a second click can't send a reply nobody is waiting for.
-            self.runs[position].state.lock().unwrap().record.questions = None;
-            self.answer.clear();
+            entry.state.lock().unwrap().record.questions = None;
+            entry.drafts.clear();
         }
     }
 
@@ -626,6 +680,27 @@ impl App {
             self.notice = Some(format!("Could not discard worktree: {error}"));
         }
     }
+}
+
+/// One question: its text, a button per option, and a field for typing something else.
+fn question_input(ui: &mut egui::Ui, number: usize, question: &Question, draft: &mut QuestionDraft) {
+    ui.label(format!("{}. {}", number + 1, question.text));
+    if !question.options.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            for (index, option) in question.options.iter().enumerate() {
+                let label = if question.recommended == Some(index) { format!("{option} (recommended)") } else { option.clone() };
+                if ui.selectable_label(draft.selected == Some(index), label).clicked() {
+                    draft.click_option(index);
+                }
+            }
+        });
+    }
+    let hint = if question.options.is_empty() { "Your answer" } else { "Other" };
+    let other = TextEdit::multiline(&mut draft.other).hint_text(hint).desired_rows(1).desired_width(f32::INFINITY);
+    if ui.add(other).changed() {
+        draft.other_edited();
+    }
+    ui.add_space(8.0);
 }
 
 fn truncated(text: &str, max: usize) -> String {
@@ -726,5 +801,86 @@ impl eframe::App for App {
         {
             thread::sleep(Duration::from_millis(50));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pick(option: usize) -> QuestionDraft {
+        QuestionDraft { selected: Some(option), other: String::new() }
+    }
+
+    fn typed(text: &str) -> QuestionDraft {
+        QuestionDraft { selected: None, other: text.to_string() }
+    }
+
+    fn choice() -> Question {
+        Question { text: "Which?".into(), options: vec!["A".into(), "B".into()], recommended: Some(1) }
+    }
+
+    #[test]
+    fn a_draft_starts_on_the_recommended_option() {
+        assert_eq!(QuestionDraft::new(&choice()), pick(1));
+        assert_eq!(QuestionDraft::new(&Question::plain("Why?")), QuestionDraft::default());
+    }
+
+    #[test]
+    fn the_reply_has_one_numbered_line_per_question_without_the_recommended_suffix() {
+        let questions = [choice(), Question::plain("Why?"), choice()];
+        let drafts = [pick(1), QuestionDraft::default(), pick(0)];
+        assert_eq!(build_reply(&questions, &drafts).as_deref(), Some("1. B\n2. (no answer)\n3. A"));
+    }
+
+    #[test]
+    fn typed_text_wins_over_a_selection_and_is_trimmed() {
+        let draft = QuestionDraft { selected: Some(0), other: "  neither  ".into() };
+        assert_eq!(build_reply(&[choice()], &[draft]).as_deref(), Some("1. neither"));
+        let blank = QuestionDraft { selected: Some(0), other: "  ".into() };
+        assert_eq!(build_reply(&[choice()], &[blank]).as_deref(), Some("1. A"));
+    }
+
+    #[test]
+    fn no_answers_at_all_means_no_reply() {
+        assert_eq!(build_reply(&[choice(), Question::plain("Why?")], &[QuestionDraft::default(), typed("   ")]), None);
+    }
+
+    #[test]
+    fn clicking_selects_replaces_and_deselects_and_clears_typed_text() {
+        let mut draft = typed("mine");
+        draft.click_option(0);
+        assert_eq!(draft, pick(0));
+        draft.click_option(1);
+        assert_eq!(draft, pick(1));
+        draft.click_option(1);
+        assert_eq!(draft, QuestionDraft::default());
+    }
+
+    #[test]
+    fn typing_clears_the_selection_and_clearing_the_text_does_not_bring_it_back() {
+        let mut draft = pick(0);
+        draft.other = "  ".into();
+        draft.other_edited();
+        assert_eq!(draft.selected, Some(0), "whitespace isn't an answer");
+
+        draft.other = "mine".into();
+        draft.other_edited();
+        assert_eq!(draft.selected, None);
+
+        draft.other.clear();
+        draft.other_edited();
+        assert_eq!(draft, QuestionDraft::default());
+    }
+
+    #[test]
+    fn enough_sends_what_is_selected_or_else_just_proceeds() {
+        match enough_reply(Some("1. A".into())) {
+            GrillReply::Answer(answer) => {
+                assert_eq!(answer, "1. A\n\nThat's everything from me: settle anything still open and write the brief.")
+            }
+            GrillReply::Proceed => panic!("the selections would be lost"),
+        }
+        assert!(matches!(enough_reply(None), GrillReply::Proceed));
     }
 }

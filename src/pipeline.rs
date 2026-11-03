@@ -101,6 +101,64 @@ impl RunKind {
     }
 }
 
+/// Something the grill agent wants to know, and the answers it suggests, if any.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(from = "QuestionForm")]
+pub struct Question {
+    pub text: String,
+    pub options: Vec<String>,
+    /// Index into `options` of the one the agent would pick.
+    pub recommended: Option<usize>,
+}
+
+/// Saved runs and plain replies can hold a bare string, so both forms have to keep loading.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum QuestionForm {
+    Text(String),
+    Full {
+        text: String,
+        #[serde(default)]
+        options: Vec<String>,
+        #[serde(default)]
+        recommended: Option<usize>,
+    },
+}
+
+impl From<QuestionForm> for Question {
+    fn from(form: QuestionForm) -> Self {
+        match form {
+            QuestionForm::Text(text) => Question::plain(text),
+            QuestionForm::Full { text, options, recommended } => Question { text, options, recommended },
+        }
+    }
+}
+
+impl Question {
+    /// A question with nothing to pick from.
+    pub fn plain(text: impl Into<String>) -> Self {
+        Question { text: text.into(), options: Vec::new(), recommended: None }
+    }
+
+    /// Trims the options and drops empty ones. `recommended` stays on the option it pointed at,
+    /// and becomes `None` if that option is gone or never existed.
+    fn normalise(&mut self) {
+        let mut options = Vec::new();
+        let mut recommended = None;
+        for (index, option) in self.options.iter().enumerate() {
+            let option = option.trim();
+            if !option.is_empty() {
+                if self.recommended == Some(index) {
+                    recommended = Some(options.len());
+                }
+                options.push(option.to_string());
+            }
+        }
+        self.options = options;
+        self.recommended = recommended;
+    }
+}
+
 /// One round of the grill: what the agent asked and what it was told.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Exchange {
@@ -126,7 +184,7 @@ pub struct RunRecord {
     pub worktree: Option<PathBuf>,
     pub branch: Option<String>,
     /// Questions waiting on the user. The run is paused while this is set.
-    pub questions: Option<Vec<String>>,
+    pub questions: Option<Vec<Question>>,
     pub transcript: Vec<Exchange>,
     pub brief: Option<String>,
     pub release_tag: Option<String>,
@@ -201,7 +259,7 @@ struct GrillTurn {
     #[serde(default)]
     status: String,
     #[serde(default)]
-    questions: Vec<String>,
+    questions: Vec<Question>,
     #[serde(default)]
     title: String,
     #[serde(default)]
@@ -536,6 +594,7 @@ impl Run {
                 }
             };
             self.log(&format!("You: {answer}"));
+            let questions: Vec<String> = questions.into_iter().map(|question| question.text).collect();
             self.update(|record| {
                 record.questions = None;
                 record.transcript.push(Exchange { questions, answer });
@@ -955,10 +1014,12 @@ impl Run {
 fn parse_grill_turn(result: &AgentResult) -> GrillTurn {
     let parsed = result.structured.clone().and_then(|value| serde_json::from_value(value).ok());
     // If the structured reply went missing, the text is still something to put to the user.
-    parsed.unwrap_or_else(|| GrillTurn {
-        questions: Some(result.summary.trim().to_string()).filter(|s| !s.is_empty()).into_iter().collect(),
+    let mut turn: GrillTurn = parsed.unwrap_or_else(|| GrillTurn {
+        questions: Some(result.summary.trim()).filter(|s| !s.is_empty()).map(Question::plain).into_iter().collect(),
         ..Default::default()
-    })
+    });
+    turn.questions.iter_mut().for_each(Question::normalise);
+    turn
 }
 
 fn has_release_workflow(dir: &Path) -> bool {
@@ -1361,7 +1422,7 @@ mod tests {
         wait_until(&handle.state, "questions", |s| s.record.questions.is_some());
         {
             let state = handle.state.lock().unwrap();
-            assert_eq!(state.record.questions.as_ref().unwrap()[1], "Keep the old one?");
+            assert_eq!(state.record.questions.as_ref().unwrap()[1].text, "Keep the old one?");
             assert!(state.record.branch.is_none(), "no branch until the solution is settled");
             assert!(agent.builds.lock().unwrap().is_empty(), "no building during the grill");
         }
@@ -1382,6 +1443,111 @@ mod tests {
         assert!(prompt.contains("Add CSV to the list view."));
         assert!(prompt.contains("Q: Keep the old one?\n") && prompt.contains("A: The list view. Replace it."));
         assert!(sh(&fx.remote, &["log", "-1", "--format=%s", "main"]).starts_with("Add CSV export"));
+    }
+
+    #[test]
+    fn grill_options_reach_the_record_but_only_the_text_reaches_the_transcript() {
+        let fx = fixture();
+        let mut agent = FakeAgent::new(Box::new(write_fixed));
+        agent.grill = Box::new(|turn| match turn {
+            1 => json!({"status": "questions", "questions": [
+                {"text": "Which format?", "options": [" CSV ", "", "JSON"], "recommended": 2},
+                {"text": "Anything else?"},
+            ]}),
+            _ => ready(),
+        });
+        let agent = Arc::new(agent);
+        let handle = start(fx.project.clone(), build("Add export"), env_for(&fx, agent.clone(), Arc::new(FakeForge::default())));
+
+        wait_until(&handle.state, "questions", |s| s.record.questions.is_some());
+        {
+            let state = handle.state.lock().unwrap();
+            let questions = state.record.questions.as_ref().unwrap();
+            assert_eq!(questions[0].text, "Which format?");
+            assert_eq!(questions[0].options, ["CSV", "JSON"]);
+            assert_eq!(questions[0].recommended, Some(1));
+            assert_eq!(questions[1], Question::plain("Anything else?"));
+        }
+        handle.replies.send(GrillReply::Answer("1. JSON\n2. (no answer)".into())).unwrap();
+        handle.thread.join().unwrap();
+
+        let state = handle.state.lock().unwrap();
+        assert_eq!(state.record.status, RunStatus::Succeeded, "{:?}", state.record.error);
+        assert_eq!(state.record.questions, None);
+        assert_eq!(
+            state.record.transcript,
+            [Exchange {
+                questions: vec!["Which format?".to_string(), "Anything else?".to_string()],
+                answer: "1. JSON\n2. (no answer)".to_string(),
+            }]
+        );
+        assert_eq!(agent.grills.lock().unwrap()[1].0, "1. JSON\n2. (no answer)");
+    }
+
+    #[test]
+    fn a_question_loads_from_a_plain_string_or_an_object() {
+        let plain: Question = serde_json::from_value(json!("Which?")).unwrap();
+        assert_eq!(plain, Question { text: "Which?".into(), options: vec![], recommended: None });
+
+        let bare: Question = serde_json::from_value(json!({"text": "Which?"})).unwrap();
+        assert_eq!(bare, plain);
+
+        let full: Question = serde_json::from_value(json!({"text": "Which?", "options": ["A", "B"], "recommended": 1})).unwrap();
+        assert_eq!(full, Question { text: "Which?".into(), options: vec!["A".into(), "B".into()], recommended: Some(1) });
+
+        let saved = serde_json::to_value(&full).unwrap();
+        assert_eq!(serde_json::from_value::<Question>(saved).unwrap(), full);
+    }
+
+    #[test]
+    fn saved_runs_with_plain_string_questions_still_load() {
+        let fx = fixture();
+        let (record, _, _) = run(&fx, Box::new(write_fixed));
+        let mut old = serde_json::to_value(&record).unwrap();
+        old["id"] = json!("99999999-000000-0000");
+        old["status"] = serde_json::to_value(RunStatus::Running).unwrap();
+        old["questions"] = json!(["old"]);
+        let dir = fx.paths.runs_dir().join("99999999-000000-0000");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("run.json"), old.to_string()).unwrap();
+
+        let loaded = load_records(&fx.paths);
+        assert_eq!(loaded.len(), 2, "the old record isn't dropped");
+        assert_eq!(loaded[0].id, "99999999-000000-0000");
+        assert_eq!(loaded[0].status, RunStatus::Interrupted);
+        assert_eq!(loaded[0].questions, None);
+    }
+
+    fn parsed_question(question: serde_json::Value) -> Question {
+        let result = AgentResult { structured: Some(json!({"status": "questions", "questions": [question]})), ..Default::default() };
+        parse_grill_turn(&result).questions.remove(0)
+    }
+
+    #[test]
+    fn options_are_cleaned_up_when_a_turn_is_parsed() {
+        let cleaned = parsed_question(json!({"text": "Q", "options": [" A ", "  ", "B"], "recommended": 0}));
+        assert_eq!(cleaned.options, ["A", "B"]);
+        assert_eq!(cleaned.recommended, Some(0));
+
+        let out_of_range = parsed_question(json!({"text": "Q", "options": ["A", "B"], "recommended": 2}));
+        assert_eq!(out_of_range.recommended, None);
+
+        let out_after_dropping = parsed_question(json!({"text": "Q", "options": ["A", "", ""], "recommended": 2}));
+        assert_eq!(out_after_dropping.options, ["A"]);
+        assert_eq!(out_after_dropping.recommended, None);
+
+        let shifted = parsed_question(json!({"text": "Q", "options": ["", "A", "B"], "recommended": 2}));
+        assert_eq!(shifted.options[shifted.recommended.unwrap()], "B", "still recommends the same option");
+
+        let no_options = parsed_question(json!({"text": "Q", "recommended": 0}));
+        assert_eq!(no_options, Question::plain("Q"));
+    }
+
+    #[test]
+    fn a_missing_structured_reply_becomes_a_question_without_options() {
+        let result = AgentResult { summary: " What now? ".into(), ..Default::default() };
+        assert_eq!(parse_grill_turn(&result).questions, [Question::plain("What now?")]);
+        assert!(parse_grill_turn(&AgentResult::default()).questions.is_empty());
     }
 
     #[test]
@@ -1959,7 +2125,7 @@ mod tests {
         let mut stale = record.clone();
         stale.id = "99999999-000000-0000".into();
         stale.status = RunStatus::Running;
-        stale.questions = Some(vec!["Still there?".into()]);
+        stale.questions = Some(vec![Question::plain("Still there?")]);
         save(&fx.paths, &stale).unwrap();
 
         let loaded = load_records(&fx.paths);
