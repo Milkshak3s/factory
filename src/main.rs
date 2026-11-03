@@ -5,7 +5,6 @@ mod app;
 mod config;
 mod forge;
 mod git;
-mod makefile;
 mod pipeline;
 mod proc;
 mod version;

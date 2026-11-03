@@ -335,7 +335,9 @@ impl App {
         }
         if needs_makefile {
             let label = format!("Create Makefile and push to {}", project.default_branch);
-            if ui.button(label).on_hover_text("Adds a starter Makefile for this project's language").clicked() {
+            let hint = "An agent writes it from the project's tests and CI, and it has to pass before it's pushed";
+            let enabled = self.claude.is_some();
+            if ui.add_enabled(enabled, egui::Button::new(label)).on_hover_text(hint).clicked() {
                 self.start_run(ui.ctx(), project.clone(), RunKind::CreateMakefile);
             }
         }
@@ -506,6 +508,9 @@ impl App {
         if let Some(target) = &record.pushed_to {
             let commit = record.commit.as_deref().map(|c| &c[..c.len().min(10)]).unwrap_or("");
             ui.colored_label(GREEN, format!("Pushed {commit} to {target}"));
+        }
+        if let Some(note) = &record.note {
+            ui.colored_label(AMBER, note);
         }
         if let Some(url) = &record.release_url {
             ui.hyperlink_to(format!("Published {}", record.release_tag.as_deref().unwrap_or("release")), url);

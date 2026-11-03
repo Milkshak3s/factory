@@ -8,11 +8,14 @@ them is run by the factory, so those steps happen regardless of what an agent do
 Prepare → Grill → Branch → Build ⇄ Test → Commit → Merge → Release → Publish
 ```
 
+0. **Prepare:** fetches `origin`, starts the run from the latest default branch, and fast-forwards
+   your local copy of it too. If local commits or edits stop that fast-forward, it warns and carries
+   on, because the run works from `origin` either way. Your unpushed work stays out of the run.
 1. **Grill:** an agent reads the code and questions you, in rounds, until the request has narrowed
    to one specific solution. It can read files but not change anything. *Enough, build it* tells it
    to settle whatever is left.
-2. **Branch:** a local `factory/<run-id>` branch, in its own git worktree. Your checkout is never
-   touched, and several runs can go at once.
+2. **Branch:** a local `factory/<run-id>` branch, in its own git worktree, so several runs can go at
+   once and none of them edit your checkout.
 3. **Build:** a fresh agent gets the agreed brief and the Q&A behind it. If tests fail, their output
    goes back to the same session, up to *Max attempts* rounds.
 4. **Test:** `make test` is the gate. Nothing is committed unless it passes.
@@ -80,10 +83,13 @@ cargo run --release
 ```
 
 Use *Add…* to pick a repo, or a folder of repos. Each project needs an `origin` remote and a
-Makefile with a `test` target. If the Makefile is missing, *Create Makefile* pushes a starter for
-the project's language to the default branch. For a project it can't recognize, the starter's
-`test` target fails until you write one, because a gate that passes with no tests would wave every
-change through.
+Makefile with a `test` target.
+
+If the Makefile is missing, *Create Makefile* has an agent write one from the project's tests and CI.
+That agent can write files but can't run commands. The factory runs `make test`, sends failures back
+to it, and pushes to the default branch only once the Makefile passes. If the agent reports that the
+project has no tests, `make test` must fail instead, because a gate that passes with no tests would
+wave every change through. Runs on that project can't land until it has tests.
 
 Configuration is in `%APPDATA%\factory\config.toml`. Run history, worktrees and a per-project Cargo
 cache are in `%LOCALAPPDATA%\factory`.

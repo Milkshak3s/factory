@@ -17,7 +17,6 @@ use crate::agent::{Agent, AgentRequest, AgentResult, Role};
 use crate::config::{Paths, Project};
 use crate::forge::Forge;
 use crate::git::{git, git_cmd, latest_tag, origin_url};
-use crate::makefile;
 use crate::proc::{Cancel, Exit, command, run_streaming, shell};
 use crate::version::{self, Bump, Manifest};
 
@@ -133,6 +132,9 @@ pub struct RunRecord {
     pub release_tag: Option<String>,
     pub release_url: Option<String>,
     pub release_notes: Option<String>,
+    /// Something a successful run still needs the user to know.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 pub struct RunState {
@@ -225,7 +227,7 @@ pub fn plan_for(project: &Project, kind: &RunKind) -> Vec<Stage> {
             }
             plan.extend([Stage::Test, Stage::Release, Stage::Publish]);
         }
-        RunKind::CreateMakefile => plan.extend([Stage::Commit, Stage::Merge]),
+        RunKind::CreateMakefile => plan.extend([Stage::Agent, Stage::Test, Stage::Commit, Stage::Merge]),
     }
     plan
 }
@@ -261,6 +263,7 @@ pub fn start(project: Project, kind: RunKind, env: Env) -> RunHandle {
         release_tag: None,
         release_url: None,
         release_notes: None,
+        note: None,
     };
     let dir = env.paths.runs_dir().join(&id);
     let _ = fs::create_dir_all(&dir);
@@ -412,6 +415,7 @@ impl Run {
         }
         let default = &self.project.default_branch;
         self.git_stream(repo, &["fetch", "--tags", "origin", default])?;
+        self.pull_local_branch();
         let base_sha = git(repo, &["rev-parse", "--verify", &format!("origin/{default}")])?;
 
         if let Some(parent) = self.worktree.parent() {
@@ -431,6 +435,26 @@ impl Run {
             }
         }
         Ok(base_sha)
+    }
+
+    /// Brings the local default branch up to date too. Only ever a fast-forward: runs work from
+    /// `origin` either way, so local edits or commits are a warning rather than a reason to stop.
+    fn pull_local_branch(&self) {
+        let repo = &self.project.path;
+        let default = &self.project.default_branch;
+        if git(repo, &["rev-parse", "--verify", "-q", &format!("refs/heads/{default}")]).is_err() {
+            return;
+        }
+        let current = git(repo, &["symbolic-ref", "--short", "HEAD"]).unwrap_or_default();
+        let pulled = if current == *default {
+            git(repo, &["merge", "--ff-only", &format!("origin/{default}")])
+        } else {
+            git(repo, &["fetch", "origin", &format!("{default}:{default}")])
+        };
+        match pulled {
+            Ok(_) => self.log(&format!("Local {default} is up to date with origin/{default}")),
+            Err(error) => self.log(&format!("WARNING: could not update local {default}: {error}")),
+        }
     }
 
     fn make_has_test_target(&self) -> Result<bool, Stop> {
@@ -659,18 +683,48 @@ impl Run {
         self.release(bump)
     }
 
+    /// Has an agent write the Makefile, then holds it to what it claims about the project.
     fn create_makefile(&self) -> Result<(), Stop> {
         let wt = &self.worktree;
-        self.stage(Stage::Prepare, 1, || self.prepare(false))?;
-        self.stage(Stage::Commit, 1, || {
-            let path = wt.join("Makefile");
-            if path.exists() {
+        self.stage(Stage::Prepare, 1, || {
+            self.prepare(false)?;
+            if wt.join("Makefile").exists() {
                 return Err(Stop::Failed("This project already has a Makefile".into()));
             }
-            fs::write(&path, makefile::template(wt)).map_err(|e| e.to_string())?;
-            if !self.make_has_test_target()? {
-                return Err(Stop::Failed("The generated Makefile doesn't parse".into()));
+            Ok(())
+        })?;
+
+        let max_attempts = self.project.max_attempts.max(1);
+        let mut attempt = 1;
+        let mut prompt = "Write the Makefile for this project.".to_string();
+        let mut session = None;
+        let has_tests = loop {
+            let result = self.stage(Stage::Agent, attempt, || self.run_makefile_agent(prompt.clone(), session.clone()))?;
+            session = result.session_id.clone().or(session);
+            let has_tests = result.structured.as_ref().and_then(|v| v["has_tests"].as_bool()).unwrap_or(true);
+            match self.stage(Stage::Test, attempt, || self.check_new_gate(has_tests)) {
+                Ok(()) => break has_tests,
+                Err(Stop::TestsFailed(problem)) if attempt < max_attempts => {
+                    prompt = format!("{problem}\n\nFix the Makefile.");
+                    attempt += 1;
+                }
+                Err(Stop::TestsFailed(problem)) => {
+                    return Err(Stop::Failed(format!("No working Makefile after {attempt} attempt(s). {problem}")));
+                }
+                Err(stop) => return Err(stop),
             }
+        };
+        if !has_tests {
+            let note = "This project has no tests yet, so `make test` fails until it does. Runs can't land until then.";
+            self.log(note);
+            self.update(|record| record.note = Some(note.to_string()));
+        }
+
+        self.stage(Stage::Commit, 1, || {
+            for line in fs::read_to_string(wt.join("Makefile")).map_err(|e| e.to_string())?.lines() {
+                self.log(line);
+            }
+            // Just the Makefile: running the tests may have left other files behind.
             self.git_stream(wt, &["add", "Makefile"])?;
             self.git_stream(wt, &["commit", "--message", "Add Makefile"])
         })?;
@@ -682,6 +736,39 @@ impl Run {
             record.pushed_to = Some(format!("origin/{}", self.project.default_branch));
         });
         Ok(())
+    }
+
+    fn run_makefile_agent(&self, prompt: String, resume: Option<String>) -> Result<AgentResult, Stop> {
+        let wt = &self.worktree;
+        let head_before = git(wt, &["rev-parse", "HEAD"])?;
+        let result = self.call_agent(Role::Makefile, prompt, resume)?;
+        if git(wt, &["rev-parse", "HEAD"])? != head_before {
+            return Err(Stop::Failed("The agent moved HEAD, which only the pipeline may do".into()));
+        }
+        let changed = git(wt, &["status", "--porcelain"])?;
+        if let Some(other) = changed.lines().find(|line| line.get(3..) != Some("Makefile")) {
+            return Err(Stop::Failed(format!("The agent changed more than the Makefile: {other}")));
+        }
+        Ok(result)
+    }
+
+    /// A Makefile has to run the tests it says exist. And if it says there are none, `make test`
+    /// has to fail, because a gate that passes with no tests would wave every change through.
+    fn check_new_gate(&self, has_tests: bool) -> Result<(), Stop> {
+        if !self.worktree.join("Makefile").exists() {
+            return Err(Stop::TestsFailed("There is no Makefile in the project root.".into()));
+        }
+        if !self.make_has_test_target()? {
+            return Err(Stop::TestsFailed("`make -n test` failed: the Makefile has no usable `test` target.".into()));
+        }
+        let (passed, tail) = self.shell_stage(TEST_COMMAND, &self.build_env())?;
+        match (has_tests, passed) {
+            (true, false) => Err(Stop::TestsFailed(format!("`{TEST_COMMAND}` failed:\n```\n{tail}\n```"))),
+            (false, true) => Err(Stop::TestsFailed(format!(
+                "You reported no tests, but `{TEST_COMMAND}` passed. With no tests it must exit non-zero."
+            ))),
+            _ => Ok(()),
+        }
     }
 
     /// Cuts the release, then promotes it from draft to published once it's finished.
@@ -1007,6 +1094,7 @@ mod tests {
         script: Script,
         grill: GrillScript,
         summary: Option<String>,
+        reports_tests: bool,
     }
 
     impl FakeAgent {
@@ -1017,6 +1105,7 @@ mod tests {
                 script,
                 grill: Box::new(|_| ready()),
                 summary: Some("Intro line\n- Fixed the bug\n- Added a test".to_string()),
+                reports_tests: true,
             }
         }
     }
@@ -1045,14 +1134,15 @@ mod tests {
                     }
                     None => Err("summary unavailable".to_string()),
                 },
-                Role::Build => {
+                Role::Build | Role::Makefile => {
                     let attempt = {
                         let mut builds = self.builds.lock().unwrap();
                         builds.push((request.prompt.clone(), request.resume.clone()));
                         builds.len()
                     };
                     (self.script)(&request, attempt)?;
-                    Ok(Some(AgentResult { session_id, summary: "Did the thing.".into(), structured: None }))
+                    let structured = (request.role == Role::Makefile).then(|| json!({"has_tests": self.reports_tests}));
+                    Ok(Some(AgentResult { session_id, summary: "Did the thing.".into(), structured }))
                 }
             }
         }
@@ -1618,24 +1708,183 @@ mod tests {
         assert!(forge.releases.lock().unwrap().is_empty());
     }
 
-    #[test]
-    fn create_makefile_pushes_a_working_starter_to_main() {
-        let fx = fixture_with(&[("Cargo.toml", CARGO_TOML)]);
-        let (record, agent, _) = run_with(&fx, RunKind::CreateMakefile, FakeAgent::new(Box::new(write_fixed)), FakeForge { not_ready: true, ..Default::default() });
-        assert_eq!(record.status, RunStatus::Succeeded, "{:?}", record.error);
-        assert_eq!(stage_names(&record), ["Prepare", "Commit", "Merge"]);
-        assert!(sh(&fx.remote, &["show", "main:Makefile"]).contains("cargo test"));
-        assert_eq!(sh(&fx.remote, &["log", "-1", "--format=%s", "main"]), "Add Makefile");
-        assert!(agent.grills.lock().unwrap().is_empty());
+    fn write_makefile(request: &AgentRequest, required_file: &str) -> Result<(), String> {
+        fs::write(request.dir.join("Makefile"), makefile_requiring(required_file)).map_err(|e| e.to_string())
+    }
+
+    fn create_makefile_run(fx: &Fixture, agent: FakeAgent) -> (RunRecord, Arc<FakeAgent>) {
+        // No GitHub access is needed, so an unready forge mustn't get in the way.
+        let forge = FakeForge { not_ready: true, ..Default::default() };
+        let (record, agent, _) = run_with(fx, RunKind::CreateMakefile, agent, forge);
+        (record, agent)
     }
 
     #[test]
-    fn create_makefile_wont_overwrite_one() {
+    fn an_agents_makefile_is_tested_then_pushed_to_main() {
+        let fx = fixture_with(&[]);
+        let script: Script = Box::new(|request, _| write_makefile(request, "README.md"));
+        let (record, agent) = create_makefile_run(&fx, FakeAgent::new(script));
+
+        assert_eq!(record.status, RunStatus::Succeeded, "{:?}", record.error);
+        assert_eq!(stage_names(&record), ["Prepare", "Build", "Test", "Commit", "Merge"]);
+        assert!(sh(&fx.remote, &["show", "main:Makefile"]).contains("git hash-object README.md"));
+        assert_eq!(sh(&fx.remote, &["log", "-1", "--format=%s", "main"]), "Add Makefile");
+        assert_eq!(record.note, None);
+        assert!(agent.grills.lock().unwrap().is_empty(), "nothing to grill the user about");
+    }
+
+    #[test]
+    fn a_failing_makefile_goes_back_to_the_agent_and_nothing_lands_until_it_passes() {
+        let fx = fixture_with(&[]);
+        let script: Script = Box::new(|request, attempt| {
+            write_makefile(request, if attempt == 1 { "missing.txt" } else { "README.md" })
+        });
+        let (record, agent) = create_makefile_run(&fx, FakeAgent::new(script));
+
+        assert_eq!(record.status, RunStatus::Succeeded, "{:?}", record.error);
+        assert_eq!(stage_names(&record), ["Prepare", "Build", "Test", "Build", "Test", "Commit", "Merge"]);
+        let builds = agent.builds.lock().unwrap();
+        assert!(builds[1].0.contains("make test") && builds[1].0.contains("failed"), "{}", builds[1].0);
+        assert_eq!(builds[1].1.as_deref(), Some("session-1"));
+        assert!(sh(&fx.remote, &["show", "main:Makefile"]).contains("README.md"));
+    }
+
+    #[test]
+    fn a_makefile_that_never_passes_doesnt_land() {
+        let fx = fixture_with(&[]);
+        let main_before = sh(&fx.remote, &["rev-parse", "main"]);
+        let script: Script = Box::new(|request, _| write_makefile(request, "missing.txt"));
+        let (record, agent) = create_makefile_run(&fx, FakeAgent::new(script));
+        assert_eq!(record.status, RunStatus::Failed);
+        assert_eq!(agent.builds.lock().unwrap().len(), 3);
+        assert_eq!(sh(&fx.remote, &["rev-parse", "main"]), main_before);
+    }
+
+    #[test]
+    fn a_project_with_no_tests_gets_a_failing_gate_and_a_note() {
+        let fx = fixture_with(&[]);
+        let mut agent = FakeAgent::new(Box::new(|request, _| write_makefile(request, "no-tests-yet")));
+        agent.reports_tests = false;
+        let (record, _) = create_makefile_run(&fx, agent);
+        assert_eq!(record.status, RunStatus::Succeeded, "{:?}", record.error);
+        assert!(record.note.unwrap().contains("no tests"));
+        assert!(sh(&fx.remote, &["show", "main:Makefile"]).contains("no-tests-yet"));
+    }
+
+    #[test]
+    fn claiming_no_tests_cant_land_a_gate_that_passes() {
+        let fx = fixture_with(&[]);
+        let main_before = sh(&fx.remote, &["rev-parse", "main"]);
+        let mut agent = FakeAgent::new(Box::new(|request, _| write_makefile(request, "README.md")));
+        agent.reports_tests = false;
+        let (record, agent) = create_makefile_run(&fx, agent);
+        assert_eq!(record.status, RunStatus::Failed);
+        assert!(agent.builds.lock().unwrap()[1].0.contains("must exit non-zero"));
+        assert_eq!(sh(&fx.remote, &["rev-parse", "main"]), main_before);
+    }
+
+    #[test]
+    fn a_makefile_agent_can_only_touch_the_makefile() {
+        let fx = fixture_with(&[]);
+        let main_before = sh(&fx.remote, &["rev-parse", "main"]);
+        let script: Script = Box::new(|request, _| {
+            write_makefile(request, "README.md")?;
+            fs::write(request.dir.join("README.md"), "changed\n").map_err(|e| e.to_string())
+        });
+        let (record, _) = create_makefile_run(&fx, FakeAgent::new(script));
+        assert_eq!(record.status, RunStatus::Failed);
+        assert!(record.error.unwrap().contains("more than the Makefile"));
+        assert_eq!(sh(&fx.remote, &["rev-parse", "main"]), main_before);
+    }
+
+    #[test]
+    fn create_makefile_wont_overwrite_one_or_start_an_agent() {
         let fx = fixture();
         let original = sh(&fx.remote, &["show", "main:Makefile"]);
-        let (record, _, _) = run_with(&fx, RunKind::CreateMakefile, FakeAgent::new(Box::new(write_fixed)), FakeForge::default());
+        let (record, agent) = create_makefile_run(&fx, FakeAgent::new(Box::new(write_fixed)));
         assert_eq!(record.status, RunStatus::Failed);
+        assert!(agent.builds.lock().unwrap().is_empty());
         assert_eq!(sh(&fx.remote, &["show", "main:Makefile"]), original);
+    }
+
+    /// Pushes a commit to the remote from another clone, so the fixture's checkout falls behind.
+    fn push_from_elsewhere(fx: &Fixture, file: &str) -> String {
+        let other = fx.dir.path().join(format!("clone-{file}"));
+        sh(fx.dir.path(), &["clone", &fx.remote.to_string_lossy(), &other.to_string_lossy()]);
+        configure(&other);
+        fs::write(other.join(file), "theirs\n").unwrap();
+        sh(&other, &["add", "."]);
+        sh(&other, &["commit", "-m", "someone else's work"]);
+        sh(&other, &["push", "origin", "main"]);
+        sh(&other, &["rev-parse", "HEAD"])
+    }
+
+    fn logged(fx: &Fixture, record: &RunRecord, text: &str) -> bool {
+        read_log(&fx.paths, &record.id).iter().any(|line| line.contains(text))
+    }
+
+    /// Fails the run right after Prepare, which is all these tests need to see.
+    fn stop_after_pull() -> FakeAgent {
+        let mut agent = FakeAgent::new(Box::new(write_fixed));
+        agent.grill = Box::new(|_| json!({"status": "ready"}));
+        agent
+    }
+
+    #[test]
+    fn the_first_step_pulls_the_latest_main_into_the_checkout_and_the_run() {
+        let fx = fixture();
+        let tip = push_from_elsewhere(&fx, "theirs.txt");
+        let script: Script = Box::new(|request, attempt| {
+            assert!(request.dir.join("theirs.txt").exists(), "the run starts from the latest main");
+            write_fixed(request, attempt)
+        });
+        let (record, _, _) = run(&fx, script);
+        assert_eq!(record.status, RunStatus::Succeeded, "{:?}", record.error);
+        assert!(fx.repo.join("theirs.txt").exists(), "the checkout is pulled too");
+        assert!(sh(&fx.repo, &["merge-base", "--is-ancestor", &tip, "main"]).is_empty());
+        assert!(logged(&fx, &record, "Local main is up to date"));
+    }
+
+    #[test]
+    fn pulling_updates_main_even_with_another_branch_checked_out() {
+        let fx = fixture();
+        sh(&fx.repo, &["switch", "--create", "my-work"]);
+        let tip = push_from_elsewhere(&fx, "theirs.txt");
+        let (record, _, _) = run_with(&fx, build("Fix"), stop_after_pull(), FakeForge::default());
+        assert_eq!(sh(&fx.repo, &["symbolic-ref", "--short", "HEAD"]), "my-work", "{:?}", record.error);
+        assert_eq!(sh(&fx.repo, &["rev-parse", "main"]), tip);
+        assert!(!fx.repo.join("theirs.txt").exists(), "the checked-out branch is left alone");
+    }
+
+    #[test]
+    fn local_commits_on_main_are_kept_and_the_run_still_starts_from_origin() {
+        let fx = fixture();
+        fs::write(fx.repo.join("mine.txt"), "mine\n").unwrap();
+        sh(&fx.repo, &["add", "."]);
+        sh(&fx.repo, &["commit", "-m", "unpushed work"]);
+        let mine = sh(&fx.repo, &["rev-parse", "main"]);
+        push_from_elsewhere(&fx, "theirs.txt");
+
+        let script: Script = Box::new(|request, attempt| {
+            assert!(request.dir.join("theirs.txt").exists());
+            assert!(!request.dir.join("mine.txt").exists(), "unpushed work stays out of the run");
+            write_fixed(request, attempt)
+        });
+        let (record, _, _) = run(&fx, script);
+        assert_eq!(record.status, RunStatus::Succeeded, "{:?}", record.error);
+        assert_eq!(sh(&fx.repo, &["rev-parse", "main"]), mine, "local work is untouched");
+        assert!(logged(&fx, &record, "WARNING: could not update local main"));
+    }
+
+    #[test]
+    fn uncommitted_edits_that_pulling_would_overwrite_are_kept() {
+        let fx = fixture();
+        push_from_elsewhere(&fx, "theirs.txt");
+        fs::write(fx.repo.join("theirs.txt"), "my uncommitted version\n").unwrap();
+        let (record, _, _) = run(&fx, Box::new(write_fixed));
+        assert_eq!(record.status, RunStatus::Succeeded, "{:?}", record.error);
+        assert_eq!(fs::read_to_string(fx.repo.join("theirs.txt")).unwrap(), "my uncommitted version\n");
+        assert!(logged(&fx, &record, "WARNING: could not update local main"));
     }
 
     #[test]
