@@ -22,6 +22,8 @@ pub struct Project {
     pub permission_mode: String,
     pub allowed_tools: String,
     pub max_attempts: u32,
+    /// Whether *Run pipeline* starts with the grill. Remembered from the last choice made for this project.
+    pub grill: bool,
 }
 
 impl Default for Project {
@@ -36,6 +38,7 @@ impl Default for Project {
             permission_mode: "acceptEdits".to_string(),
             allowed_tools: String::new(),
             max_attempts: 3,
+            grill: true,
         }
     }
 }
@@ -145,6 +148,20 @@ mod tests {
         };
         config.save(&file).unwrap();
         assert_eq!(Config::load(&file).unwrap().projects, config.projects);
+    }
+
+    #[test]
+    fn the_grill_defaults_to_on_and_turning_it_off_is_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        fs::write(&file, "[[projects]]\nname = \"x\"\n").unwrap();
+        let mut config = Config::load(&file).unwrap();
+        assert!(config.projects[0].grill, "projects saved before the setting existed keep the grill");
+
+        config.projects[0].grill = false;
+        config.save(&file).unwrap();
+        assert!(fs::read_to_string(&file).unwrap().contains("grill = false"));
+        assert!(!Config::load(&file).unwrap().projects[0].grill);
     }
 
     #[test]

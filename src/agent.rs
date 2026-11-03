@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::proc::{Cancel, Exit, command, run_streaming};
 
 /// Told to the agent up front. The pipeline verifies what it can rather than trusting this.
-const RULES: &str = "You are the build step of a software factory. Implement the agreed solution by \
+const RULES: &str = "You are the build step of a software factory. Implement the solution or task you are given by \
 editing files in the current directory, and add or update tests for it, then stop. After you stop, \
 the factory itself runs `make test`, commits, merges, pushes and cuts releases. Do not run git \
 commit, push, tag, merge, rebase, reset, checkout or switch, and do not change branches. Do not \

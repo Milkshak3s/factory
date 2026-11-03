@@ -14,15 +14,20 @@ Prepare → Grill → Branch → Build ⇄ Test → Commit → Merge → Release
 1. **Grill:** an agent reads the code and questions you, in rounds, until the request has narrowed
    to one specific solution. It can read files but not change anything. *Enough, build it* tells it
    to settle whatever is left. Questions come with clickable options, the agent's recommendation
-   pre-selected, and an *Other* field for typing an alternative.
+   pre-selected, and an *Other* field for typing an alternative. The grill is on by default, and you
+   can turn it off per project with the *Grill first* checkbox beside *Run pipeline*. A skipped run
+   sends your prompt straight to the build agent, uses the prompt's first line as the commit title,
+   and uses the bump you chose in the radio buttons.
 2. **Branch:** a local `factory/<run-id>` branch, in its own git worktree, so several runs can go at
    once and none of them edit your checkout.
-3. **Build:** a fresh agent gets the agreed brief and the Q&A behind it. If tests fail, their output
+3. **Build:** a fresh agent gets the agreed brief and the Q&A behind it, or just your prompt if the
+   grill was skipped. If tests fail, their output
    goes back to the same session, up to *Max attempts* rounds.
 4. **Test:** `make test` is the gate. Nothing is committed unless it passes.
 5. **Merge:** rebases onto the default branch, re-tests if it moved, and pushes. History stays linear.
 6. **Release:** bumps the version, writes a bullet summary of everything since the last tag, and
-   gets a draft GitHub Release (see below). The grill picks patch, minor or major.
+   gets a draft GitHub Release (see below). The grill picks patch, minor or major, or you do with the
+   radio buttons if the grill was skipped.
 7. **Publish:** promotes the draft to published, once the release process has finished.
 
 *Cut release…* runs Test → Release → Publish on its own, for when there's no code to change.
@@ -52,7 +57,9 @@ Factory's own releases take the first route: its `.github/workflows/release.yml`
 - No agent can reach your claude.ai connectors, such as Gmail and Drive (`--strict-mcp-config`).
 
 This is not a sandbox. A determined agent could still undo the push block, or edit test files so
-they pass, and a passing run goes all the way to a public release with no further review.
+they pass, and a passing run goes all the way to a public release with no further review. Skipping
+the grill also removes the only human input before publish, so a vague prompt can be built, merged
+and published as it stands.
 
 The default `acceptEdits` mode still lets the build agent run some shell commands. In testing,
 `whoami`, `git status` and `python --version` ran, while `cargo --version` and `curl --version` were

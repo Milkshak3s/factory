@@ -86,7 +86,12 @@ pub enum RunStatus {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum RunKind {
-    Build { task: String },
+    Build {
+        task: String,
+        /// `Some(bump)` skips the grill and uses that bump. `None` runs the grill, which picks the bump.
+        #[serde(default)]
+        bump: Option<Bump>,
+    },
     Release { bump: Bump },
     CreateMakefile,
 }
@@ -94,7 +99,7 @@ pub enum RunKind {
 impl RunKind {
     pub fn title(&self) -> String {
         match self {
-            RunKind::Build { task } => subject_line(task),
+            RunKind::Build { task, .. } => subject_line(task),
             RunKind::Release { bump } => format!("Release ({} bump)", bump.label()),
             RunKind::CreateMakefile => "Create Makefile".to_string(),
         }
@@ -272,8 +277,11 @@ pub fn plan_for(project: &Project, kind: &RunKind) -> Vec<Stage> {
     let setup = !project.setup_command.trim().is_empty();
     let mut plan = vec![Stage::Prepare];
     match kind {
-        RunKind::Build { .. } => {
-            plan.extend([Stage::Grill, Stage::Branch]);
+        RunKind::Build { bump, .. } => {
+            if bump.is_none() {
+                plan.push(Stage::Grill);
+            }
+            plan.push(Stage::Branch);
             if setup {
                 plan.push(Stage::Setup);
             }
@@ -348,7 +356,7 @@ impl Run {
     fn execute(self, kind: RunKind) {
         self.persist();
         let outcome = catch_unwind(AssertUnwindSafe(|| match &kind {
-            RunKind::Build { task } => self.build(task),
+            RunKind::Build { task, bump } => self.build(task, *bump),
             RunKind::Release { bump } => self.release_only(*bump),
             RunKind::CreateMakefile => self.create_makefile(),
         }))
@@ -647,9 +655,16 @@ impl Run {
         Ok(result)
     }
 
-    fn build(&self, task: &str) -> Result<(), Stop> {
+    /// `skip_grill_with` is the bump to use when the grill is skipped.
+    fn build(&self, task: &str, skip_grill_with: Option<Bump>) -> Result<(), Stop> {
         let base = self.stage(Stage::Prepare, 1, || self.prepare(true))?;
-        let brief = self.stage(Stage::Grill, 1, || self.grill(task))?;
+        let (title, brief, bump) = match skip_grill_with {
+            Some(bump) => (subject_line(task), None, bump),
+            None => {
+                let brief = self.stage(Stage::Grill, 1, || self.grill(task))?;
+                (brief.title, Some(brief.text), brief.bump)
+            }
+        };
         self.stage(Stage::Branch, 1, || {
             self.git_stream(&self.worktree, &["switch", "--create", &self.branch])?;
             self.update(|record| record.branch = Some(self.branch.clone()));
@@ -658,7 +673,7 @@ impl Run {
         self.setup()?;
 
         let transcript = self.state.lock().unwrap().record.transcript.clone();
-        let build_prompt = initial_build_prompt(task, &brief.text, &transcript);
+        let build_prompt = initial_build_prompt(task, brief.as_deref(), &transcript);
         let max_attempts = self.project.max_attempts.max(1);
         let mut attempt = 1;
         let mut prompt = build_prompt.clone();
@@ -679,9 +694,9 @@ impl Run {
             }
         };
 
-        self.stage(Stage::Commit, 1, || self.commit(&brief.title, &summary))?;
+        self.stage(Stage::Commit, 1, || self.commit(&title, &summary))?;
         self.merge(&base, attempt)?;
-        self.release(brief.bump)
+        self.release(bump)
     }
 
     fn commit(&self, title: &str, summary: &str) -> Result<(), Stop> {
@@ -1060,8 +1075,11 @@ fn push_guard_env(origin: Option<&str>) -> Vec<(String, String)> {
     env
 }
 
-fn initial_build_prompt(task: &str, brief: &str, transcript: &[Exchange]) -> String {
-    let mut prompt = format!("Task from the user:\n{task}\n\nAgreed solution:\n{brief}\n");
+fn initial_build_prompt(task: &str, brief: Option<&str>, transcript: &[Exchange]) -> String {
+    let mut prompt = format!("Task from the user:\n{task}\n");
+    if let Some(brief) = brief {
+        prompt.push_str(&format!("\nAgreed solution:\n{brief}\n"));
+    }
     if !transcript.is_empty() {
         prompt.push_str("\nHow that was agreed:\n");
         for exchange in transcript {
@@ -1357,7 +1375,11 @@ mod tests {
     }
 
     fn build(task: &str) -> RunKind {
-        RunKind::Build { task: task.into() }
+        RunKind::Build { task: task.into(), bump: None }
+    }
+
+    fn build_without_grill(task: &str, bump: Bump) -> RunKind {
+        RunKind::Build { task: task.into(), bump: Some(bump) }
     }
 
     fn remote_refs(fx: &Fixture) -> String {
@@ -1443,6 +1465,95 @@ mod tests {
         assert!(prompt.contains("Add CSV to the list view."));
         assert!(prompt.contains("Q: Keep the old one?\n") && prompt.contains("A: The list view. Replace it."));
         assert!(sh(&fx.remote, &["log", "-1", "--format=%s", "main"]).starts_with("Add CSV export"));
+    }
+
+    #[test]
+    fn the_plan_leaves_out_the_grill_only_when_a_bump_was_chosen() {
+        let labels = |project: &Project, kind: &RunKind| -> Vec<&'static str> {
+            plan_for(project, kind).iter().map(|stage| stage.label()).collect()
+        };
+        let plain = Project::default();
+        assert_eq!(
+            labels(&plain, &build("Fix")),
+            ["Prepare", "Grill", "Branch", "Build", "Test", "Commit", "Merge", "Release", "Publish"]
+        );
+        assert_eq!(
+            labels(&plain, &build_without_grill("Fix", Bump::Patch)),
+            ["Prepare", "Branch", "Build", "Test", "Commit", "Merge", "Release", "Publish"]
+        );
+        let with_setup = Project { setup_command: "npm ci".into(), ..Default::default() };
+        assert_eq!(
+            labels(&with_setup, &build_without_grill("Fix", Bump::Major)),
+            ["Prepare", "Branch", "Setup", "Build", "Test", "Commit", "Merge", "Release", "Publish"]
+        );
+    }
+
+    #[test]
+    fn a_skipped_grill_sends_the_prompt_straight_to_the_builder_and_publishes() {
+        let fx = fixture();
+        let task = "Fix the crash\n\nIt happens on startup.";
+        let (record, agent, forge) =
+            run_with(&fx, build_without_grill(task, Bump::Minor), FakeAgent::new(Box::new(write_fixed)), FakeForge::default());
+
+        assert_eq!(record.status, RunStatus::Succeeded, "{:?}", record.error);
+        assert!(agent.grills.lock().unwrap().is_empty());
+        assert_eq!(
+            stage_names(&record),
+            ["Prepare", "Branch", "Build", "Test", "Commit", "Merge", "Release", "Publish"]
+        );
+        assert_eq!(record.kind.title(), "Fix the crash");
+        assert_eq!(record.release_tag.as_deref(), Some("v0.1.0"), "the chosen minor bump is used");
+        assert!(!forge.releases.lock().unwrap()["v0.1.0"].is_draft, "published");
+        assert_eq!(sh(&fx.remote, &["log", "-1", "--format=%s", "main"]).trim(), "Fix the crash");
+
+        let builds = agent.builds.lock().unwrap();
+        assert_eq!(builds[0].0, format!("Task from the user:\n{task}\n"));
+        assert!(!builds[0].0.contains("Agreed solution"));
+
+        assert_eq!(record.brief, None);
+        assert_eq!(record.questions, None);
+        assert!(record.transcript.is_empty());
+    }
+
+    #[test]
+    fn a_skipped_grill_still_retries_when_tests_fail() {
+        let fx = fixture();
+        let script: Script = Box::new(|request, attempt| {
+            let file = if attempt == 1 { "wrong.txt" } else { "fixed.txt" };
+            fs::write(request.dir.join(file), "x\n").map_err(|e| e.to_string())
+        });
+        let (record, agent, _) =
+            run_with(&fx, build_without_grill("Fix the crash", Bump::Patch), FakeAgent::new(script), FakeForge::default());
+
+        assert_eq!(record.status, RunStatus::Succeeded, "{:?}", record.error);
+        assert_eq!(
+            stage_names(&record),
+            ["Prepare", "Branch", "Build", "Test", "Build", "Test", "Commit", "Merge", "Release", "Publish"]
+        );
+        assert!(agent.grills.lock().unwrap().is_empty());
+        let builds = agent.builds.lock().unwrap();
+        assert!(builds[1].0.contains("it failed") && builds[1].0.contains("Fix the crash"), "{}", builds[1].0);
+        assert!(!builds[1].0.contains("Agreed solution"));
+        assert_eq!(builds[1].1.as_deref(), Some("session-1"), "the retry resumes the session");
+    }
+
+    #[test]
+    fn a_grilled_prompt_keeps_its_brief_and_transcript() {
+        let transcript = [Exchange { questions: vec!["Which?".to_string()], answer: "That one".to_string() }];
+        assert_eq!(
+            initial_build_prompt("Task", Some("Brief"), &transcript),
+            "Task from the user:\nTask\n\nAgreed solution:\nBrief\n\nHow that was agreed:\nQ: Which?\nA: That one\n"
+        );
+    }
+
+    #[test]
+    fn saved_build_runs_without_a_bump_load_as_grilled() {
+        let old: RunKind = serde_json::from_value(json!({"Build": {"task": "x"}})).unwrap();
+        assert_eq!(old, build("x"));
+
+        let skipped = build_without_grill("x", Bump::Minor);
+        let saved = serde_json::to_value(&skipped).unwrap();
+        assert_eq!(serde_json::from_value::<RunKind>(saved).unwrap(), skipped);
     }
 
     #[test]

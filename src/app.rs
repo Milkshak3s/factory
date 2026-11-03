@@ -116,6 +116,8 @@ pub struct App {
     runs: Vec<RunEntry>,
     selected_run: Option<String>,
     release_bump: Option<Bump>,
+    /// The bump for a run that skips the grill. Deliberately not remembered between runs.
+    build_bump: Bump,
     notice: Option<String>,
     running_last_frame: usize,
     /// Only set when running from the MSI's install folder.
@@ -139,6 +141,12 @@ fn status_label(status: RunStatus) -> &'static str {
         RunStatus::Cancelled => "Cancelled",
         RunStatus::Interrupted => "Interrupted",
     }
+}
+
+/// The stages *Run pipeline* will go through, shown beside the button.
+fn pipeline_hint(grill: bool, branch: &str) -> String {
+    let start = if grill { "Grill → build" } else { "Build" };
+    format!("{start} → {} → merge to {branch} → publish release", pipeline::TEST_COMMAND)
 }
 
 fn status_summary(status: &RepoStatus) -> String {
@@ -203,6 +211,7 @@ impl App {
             runs,
             selected_run: None,
             release_bump: None,
+            build_bump: Bump::Patch,
             notice,
             running_last_frame: 0,
             updater,
@@ -392,6 +401,7 @@ impl App {
                         self.selected = Some(index);
                         self.selected_run = None;
                         self.release_bump = None;
+                        self.build_bump = Bump::Patch;
                     }
                 });
                 match self.statuses.get(&path) {
@@ -472,15 +482,25 @@ impl App {
         ui.horizontal(|ui| {
             let can_build = blocker.is_none() && !self.task.trim().is_empty();
             if ui.add_enabled(can_build, egui::Button::new("Run pipeline")).clicked() {
-                let kind = RunKind::Build { task: self.task.trim().to_string() };
+                let bump = (!self.config.projects[index].grill).then_some(self.build_bump);
+                let kind = RunKind::Build { task: self.task.trim().to_string(), bump };
                 self.task.clear();
+                self.build_bump = Bump::Patch;
                 self.start_run(ui.ctx(), project.clone(), kind);
             }
-            ui.weak(format!(
-                "Grill → build → {} → merge to {} → publish release",
-                pipeline::TEST_COMMAND,
-                project.default_branch
-            ));
+            let toggle = ui.checkbox(&mut self.config.projects[index].grill, "Grill first").on_hover_text(
+                "Unchecked, the prompt goes straight to the build agent, and the run still publishes a release with no questions asked",
+            );
+            if toggle.changed() {
+                self.save_config();
+            }
+            let grill = self.config.projects[index].grill;
+            if !grill {
+                for bump in [Bump::Patch, Bump::Minor, Bump::Major] {
+                    ui.radio_value(&mut self.build_bump, bump, bump.label());
+                }
+            }
+            ui.weak(pipeline_hint(grill, &project.default_branch));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.add_enabled(blocker.is_none(), egui::Button::new("Cut release…")).clicked() {
                     self.release_bump = Some(Bump::Patch);
@@ -877,6 +897,12 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_hint_only_mentions_the_grill_when_it_will_run() {
+        assert_eq!(pipeline_hint(true, "main"), "Grill → build → make test → merge to main → publish release");
+        assert_eq!(pipeline_hint(false, "main"), "Build → make test → merge to main → publish release");
+    }
 
     fn pick(option: usize) -> QuestionDraft {
         QuestionDraft { selected: Some(option), other: String::new() }
