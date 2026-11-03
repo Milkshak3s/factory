@@ -3,9 +3,12 @@
 mod agent;
 mod app;
 mod config;
+mod forge;
 mod git;
+mod makefile;
 mod pipeline;
 mod proc;
+mod version;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {

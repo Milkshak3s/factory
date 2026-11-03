@@ -51,10 +51,12 @@ pub struct RepoStatus {
     pub last_commit_age: String,
     pub latest_tag: Option<String>,
     pub has_origin: bool,
+    /// Whether the branch runs start from has a Makefile, which is what the gate needs.
+    pub has_makefile: bool,
     pub error: Option<String>,
 }
 
-pub fn status(dir: &Path) -> RepoStatus {
+pub fn status(dir: &Path, default_branch: &str) -> RepoStatus {
     let porcelain = match git(dir, &["status", "--porcelain=v2", "--branch"]) {
         Ok(text) => text,
         Err(error) => return RepoStatus { error: Some(error), ..Default::default() },
@@ -68,6 +70,7 @@ pub fn status(dir: &Path) -> RepoStatus {
     }
     status.latest_tag = latest_tag(dir);
     status.has_origin = origin_url(dir).is_some();
+    status.has_makefile = git(dir, &["cat-file", "-e", &format!("origin/{default_branch}:Makefile")]).is_ok();
     status
 }
 
@@ -95,20 +98,6 @@ fn parse_porcelain(text: &str) -> RepoStatus {
     status
 }
 
-/// Suggests the next release tag by bumping the patch of `latest`, keeping any prefix.
-pub fn next_tag(latest: Option<&str>) -> String {
-    let Some(latest) = latest else { return "v0.1.0".to_string() };
-    let digits = latest.find(|c: char| c.is_ascii_digit()).unwrap_or(0);
-    let (prefix, version) = latest.split_at(digits);
-    let parts: Vec<_> = version.split('.').collect();
-    match parts.as_slice() {
-        [major, minor, patch] if patch.parse::<u64>().is_ok() => {
-            format!("{prefix}{major}.{minor}.{}", patch.parse::<u64>().unwrap_or(0) + 1)
-        }
-        _ => String::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,13 +110,5 @@ mod tests {
         );
         assert_eq!(status.branch, "main");
         assert_eq!((status.ahead, status.behind, status.dirty), (2, 3, 2));
-    }
-
-    #[test]
-    fn bumps_patch_and_keeps_prefix() {
-        assert_eq!(next_tag(Some("v0.3.1")), "v0.3.2");
-        assert_eq!(next_tag(Some("1.2.9")), "1.2.10");
-        assert_eq!(next_tag(None), "v0.1.0");
-        assert_eq!(next_tag(Some("nightly")), "");
     }
 }

@@ -1,4 +1,4 @@
-//! The build step: headless Claude Code, restricted to writing code.
+//! The agent stages: headless Claude Code, restricted to what each stage needs.
 
 use std::path::{Path, PathBuf};
 
@@ -7,17 +7,44 @@ use serde_json::Value;
 use crate::proc::{Cancel, Exit, command, run_streaming};
 
 /// Told to the agent up front. The pipeline verifies what it can rather than trusting this.
-const RULES: &str = "You are the build step of a software factory. Implement the task by editing \
-files in the current directory, then stop. After you stop, the factory itself runs the test \
-suite, commits, pushes and cuts releases. Do not run git commit, push, tag, merge, rebase, reset, \
-checkout or switch, and do not change branches. Do not delete, skip or weaken tests to make them \
-pass. End with a 1-3 sentence summary of the change; it becomes the commit message body.";
+const RULES: &str = "You are the build step of a software factory. Implement the agreed solution by \
+editing files in the current directory, and add or update tests for it, then stop. After you stop, \
+the factory itself runs `make test`, commits, merges, pushes and cuts releases. Do not run git \
+commit, push, tag, merge, rebase, reset, checkout or switch, and do not change branches. Do not \
+edit the Makefile. Do not delete, skip or weaken tests to make them pass. Your final message becomes \
+the commit message body, so make it only 1-3 sentences saying what changed and why, with no preamble.";
+
+const GRILL_RULES: &str = "You are the requirements step of a software factory. Your job is to \
+grill the user until the request has narrowed to one specific solution. Nothing has been built \
+yet, and a build agent will work from your brief without being able to ask anything. Read the \
+code first, and never ask what the code already answers. Then ask pointed questions about the \
+behavior, scope, edge cases and tradeoffs that would change what gets built. Name the options you \
+see and say which you'd pick. Always ask at least one round of questions, however clear the \
+request looks. Ask at most 5 questions per round, and keep going for as many rounds as it takes. \
+Once the user has answered and no question would change the solution, return status \"ready\" with a title \
+(an imperative commit subject of under 60 characters), a brief (the specific solution: what \
+changes, where, how it behaves, what is out of scope, and how to test it), and a bump: patch for \
+fixes, minor for new features, major for breaking changes. Otherwise return status \"questions\" \
+with your questions. You can't change any files.";
+
+const GRILL_SCHEMA: &str = r#"{"type":"object","properties":{"status":{"type":"string","enum":["questions","ready"]},"questions":{"type":"array","items":{"type":"string"}},"title":{"type":"string"},"brief":{"type":"string"},"bump":{"type":"string","enum":["patch","minor","major"]}},"required":["status"],"if":{"properties":{"status":{"const":"ready"}}},"then":{"required":["title","brief","bump"]}}"#;
 
 const DENIED_TOOLS: &str = "Bash(git commit:*),Bash(git push:*),Bash(git tag:*),Bash(git merge:*),\
 Bash(git rebase:*),Bash(git reset:*),Bash(git checkout:*),Bash(git switch:*),\
 Bash(git worktree:*),Bash(gh pr:*),Bash(gh release:*)";
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Role {
+    /// Reads the code and questions the user. Can't change anything.
+    Grill,
+    /// Writes the code, under the project's permission settings.
+    Build,
+    /// Turns the given text into release notes. Has no tools at all.
+    Summarize,
+}
+
 pub struct AgentRequest<'a> {
+    pub role: Role,
     pub dir: &'a Path,
     pub prompt: String,
     /// Session to continue, so a retry remembers what it already tried.
@@ -32,6 +59,7 @@ pub struct AgentRequest<'a> {
 pub struct AgentResult {
     pub session_id: Option<String>,
     pub summary: String,
+    pub structured: Option<Value>,
 }
 
 pub trait Agent: Send + Sync {
@@ -49,22 +77,37 @@ pub struct ClaudeCli {
 
 impl ClaudeCli {
     fn args(request: &AgentRequest) -> Vec<String> {
-        let mut args: Vec<String> = [
-            "-p",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--permission-mode",
-            request.permission_mode,
-            "--append-system-prompt",
-            RULES,
-            "--disallowedTools",
-            DENIED_TOOLS,
-        ]
-        .map(str::to_string)
-        .into();
-        if !request.allowed_tools.trim().is_empty() {
-            args.extend(["--allowedTools".to_string(), request.allowed_tools.trim().to_string()]);
+        // --strict-mcp-config: the login also brings claude.ai connectors like Gmail and Drive,
+        // and no stage has any business reaching those.
+        let mut args: Vec<String> = ["-p", "--output-format", "stream-json", "--verbose", "--strict-mcp-config"]
+            .map(str::to_string)
+            .into();
+        let mut add = |values: &[&str]| args.extend(values.iter().map(|v| v.to_string()));
+        match request.role {
+            Role::Grill => add(&[
+                "--permission-mode",
+                "default",
+                "--tools",
+                "Read,Grep,Glob",
+                "--append-system-prompt",
+                GRILL_RULES,
+                "--json-schema",
+                GRILL_SCHEMA,
+            ]),
+            Role::Build => {
+                add(&[
+                    "--permission-mode",
+                    request.permission_mode,
+                    "--append-system-prompt",
+                    RULES,
+                    "--disallowedTools",
+                    DENIED_TOOLS,
+                ]);
+                if !request.allowed_tools.trim().is_empty() {
+                    add(&["--allowedTools", request.allowed_tools.trim()]);
+                }
+            }
+            Role::Summarize => add(&["--tools", ""]),
         }
         if !request.model.trim().is_empty() {
             args.extend(["--model".to_string(), request.model.trim().to_string()]);
@@ -105,6 +148,9 @@ impl Agent for ClaudeCli {
                     if let Some(summary) = event.summary {
                         result.summary = summary;
                     }
+                    if event.structured.is_some() {
+                        result.structured = event.structured;
+                    }
                     if event.failure.is_some() {
                         failure = event.failure;
                     }
@@ -130,6 +176,7 @@ struct Event {
     session_id: Option<String>,
     log: Option<String>,
     summary: Option<String>,
+    structured: Option<Value>,
     failure: Option<String>,
 }
 
@@ -154,6 +201,7 @@ fn parse_event(line: &str) -> Option<Event> {
                 event.failure = Some(if text.is_empty() { "agent reported an error".into() } else { text });
             } else {
                 event.summary = Some(text);
+                event.structured = Some(value["structured_output"].clone()).filter(|v| !v.is_null());
             }
             if let Some(cost) = value["total_cost_usd"].as_f64() {
                 event.log = Some(format!("agent finished (${cost:.2})"));
@@ -219,8 +267,9 @@ fn newest_bundled(root: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    fn request(dir: &Path) -> AgentRequest<'_> {
+    fn request(dir: &Path, role: Role) -> AgentRequest<'_> {
         AgentRequest {
+            role,
             dir,
             prompt: String::new(),
             resume: Some("abc".into()),
@@ -233,13 +282,50 @@ mod tests {
 
     #[test]
     fn args_always_deny_pipeline_commands_and_resume_when_asked() {
-        let args = ClaudeCli::args(&request(Path::new(".")));
+        let args = ClaudeCli::args(&request(Path::new("."), Role::Build));
         let denied = args.iter().position(|a| a == "--disallowedTools").unwrap();
         assert!(args[denied + 1].contains("Bash(git push:*)"));
         assert!(args[denied + 1].contains("Bash(git commit:*)"));
+        assert!(args.windows(2).any(|w| w == ["--permission-mode", "acceptEdits"]));
         assert!(args.windows(2).any(|w| w == ["--resume", "abc"]));
         assert!(args.windows(2).any(|w| w == ["--model", "haiku"]));
         assert!(!args.contains(&"--allowedTools".to_string()));
+    }
+
+    #[test]
+    fn grill_and_summarize_can_only_read_or_nothing_whatever_the_project_allows() {
+        let mut grill = request(Path::new("."), Role::Grill);
+        grill.permission_mode = "bypassPermissions";
+        grill.allowed_tools = "Bash(cargo:*)";
+        let args = ClaudeCli::args(&grill);
+        assert!(args.windows(2).any(|w| w == ["--tools", "Read,Grep,Glob"]));
+        assert!(args.windows(2).any(|w| w == ["--permission-mode", "default"]));
+        assert!(args.contains(&"--json-schema".to_string()));
+        assert!(!args.iter().any(|a| a == "bypassPermissions" || a == "Bash(cargo:*)"));
+
+        let args = ClaudeCli::args(&request(Path::new("."), Role::Summarize));
+        assert!(args.windows(2).any(|w| w == ["--tools", ""]));
+    }
+
+    #[test]
+    fn every_role_is_cut_off_from_claude_ai_connectors() {
+        for role in [Role::Grill, Role::Build, Role::Summarize] {
+            assert!(ClaudeCli::args(&request(Path::new("."), role)).contains(&"--strict-mcp-config".to_string()));
+        }
+    }
+
+    #[test]
+    fn the_grill_schema_is_valid_json() {
+        let schema: Value = serde_json::from_str(GRILL_SCHEMA).unwrap();
+        assert_eq!(schema["properties"]["bump"]["enum"][1], "minor");
+    }
+
+    #[test]
+    fn reads_structured_output_from_the_result() {
+        let event = parse_event(r#"{"type":"result","is_error":false,"result":"x","structured_output":{"status":"ready"}}"#).unwrap();
+        assert_eq!(event.structured.unwrap()["status"], "ready");
+        let plain = parse_event(r#"{"type":"result","is_error":false,"result":"x","structured_output":null}"#).unwrap();
+        assert_eq!(plain.structured, None);
     }
 
     #[test]

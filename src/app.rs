@@ -3,19 +3,23 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
+use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText, ScrollArea, TextEdit};
 
 use crate::agent::{Agent, ClaudeCli, locate_claude};
-use crate::config::{self, Config, Paths, Project, PushTarget};
+use crate::config::{self, Config, Paths, Project};
+use crate::forge::{Forge, GhCli, locate_gh};
 use crate::git::{self, RepoStatus};
-use crate::pipeline::{self, Env, RunKind, RunRecord, RunState, RunStatus, Stage, StageStatus};
+use crate::pipeline::{self, Env, GrillReply, RunKind, RunRecord, RunState, RunStatus, Stage, StageStatus};
 use crate::proc::{Cancel, command};
+use crate::version::Bump;
 
 const REFRESH_EVERY: Duration = Duration::from_secs(30);
 const EXIT_GRACE: Duration = Duration::from_secs(5);
+const WORKFLOW_POLL: Duration = Duration::from_secs(15);
 
 const GREEN: Color32 = Color32::from_rgb(70, 170, 100);
 const RED: Color32 = Color32::from_rgb(215, 85, 80);
@@ -26,6 +30,7 @@ struct RunEntry {
     state: Arc<Mutex<RunState>>,
     /// Only set while this session owns the run's thread.
     cancel: Option<Cancel>,
+    replies: Option<Sender<GrillReply>>,
     thread: Option<JoinHandle<()>>,
     log_loaded: bool,
 }
@@ -34,15 +39,21 @@ pub struct App {
     paths: Paths,
     config: Config,
     claude: Option<PathBuf>,
+    gh: PathBuf,
+    /// `None` until the first check comes back. `Err` holds why `gh` can't be used.
+    gh_status: Option<Result<(), String>>,
+    gh_tx: Sender<Result<(), String>>,
+    gh_rx: mpsc::Receiver<Result<(), String>>,
     selected: Option<usize>,
     task: String,
+    answer: String,
     statuses: HashMap<PathBuf, RepoStatus>,
-    status_tx: mpsc::Sender<(PathBuf, RepoStatus)>,
+    status_tx: Sender<(PathBuf, RepoStatus)>,
     status_rx: mpsc::Receiver<(PathBuf, RepoStatus)>,
     last_refresh: Option<Instant>,
     runs: Vec<RunEntry>,
     selected_run: Option<String>,
-    release_tag: Option<String>,
+    release_bump: Option<Bump>,
     notice: Option<String>,
     running_last_frame: usize,
 }
@@ -102,24 +113,31 @@ impl App {
             .map(|record| RunEntry {
                 state: Arc::new(Mutex::new(RunState { record, log: Vec::new() })),
                 cancel: None,
+                replies: None,
                 thread: None,
                 log_loaded: false,
             })
             .collect();
         let (status_tx, status_rx) = mpsc::channel();
+        let (gh_tx, gh_rx) = mpsc::channel();
         Self {
             paths,
             selected: (!config.projects.is_empty()).then_some(0),
             config,
             claude,
+            gh: locate_gh(),
+            gh_status: None,
+            gh_tx,
+            gh_rx,
             task: String::new(),
+            answer: String::new(),
             statuses: HashMap::new(),
             status_tx,
             status_rx,
             last_refresh: None,
             runs,
             selected_run: None,
-            release_tag: None,
+            release_bump: None,
             notice,
             running_last_frame: 0,
         }
@@ -135,14 +153,24 @@ impl App {
         self.last_refresh = Some(Instant::now());
         for project in &self.config.projects {
             let path = project.path.clone();
+            let default_branch = project.default_branch.clone();
             let tx = self.status_tx.clone();
             let ctx = ctx.clone();
             thread::spawn(move || {
-                let status = git::status(&path);
+                let status = git::status(&path, &default_branch);
                 let _ = tx.send((path, status));
                 ctx.request_repaint();
             });
         }
+        // Look again each time, so installing gh takes effect without restarting the app.
+        self.gh = locate_gh();
+        let gh = GhCli { program: self.gh.clone() };
+        let tx = self.gh_tx.clone();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(gh.ready(&std::env::temp_dir()));
+            ctx.request_repaint();
+        });
     }
 
     fn add_projects(&mut self, ctx: &egui::Context) {
@@ -179,15 +207,19 @@ impl App {
         let env = Env {
             paths: self.paths.clone(),
             agent,
+            forge: Arc::new(GhCli { program: self.gh.clone() }),
             notify: Arc::new(move || repaint.request_repaint()),
+            poll_every: WORKFLOW_POLL,
         };
         let handle = pipeline::start(project, kind, env);
         self.selected_run = Some(handle.state.lock().unwrap().record.id.clone());
+        self.answer.clear();
         self.runs.insert(
             0,
             RunEntry {
                 state: handle.state,
                 cancel: Some(handle.cancel),
+                replies: Some(handle.replies),
                 thread: Some(handle.thread),
                 log_loaded: true,
             },
@@ -198,10 +230,14 @@ impl App {
         self.runs.iter().filter(|r| r.state.lock().unwrap().record.status == RunStatus::Running).count()
     }
 
-    fn last_run_status(&self, name: &str) -> Option<RunStatus> {
+    /// The color for a project's dot: its latest run, or amber if that run wants an answer.
+    fn last_run_color(&self, name: &str) -> Option<Color32> {
         self.runs.iter().find_map(|run| {
             let state = run.state.lock().unwrap();
-            (state.record.project == name).then_some(state.record.status)
+            let record = &state.record;
+            (record.project == name).then(|| {
+                if record.questions.is_some() { AMBER } else { status_color(record.status) }
+            })
         })
     }
 
@@ -228,13 +264,13 @@ impl App {
                     let project = &self.config.projects[index];
                     (project.name.clone(), project.path.clone())
                 };
-                let color = self.last_run_status(&name).map(status_color).unwrap_or(Color32::DARK_GRAY);
+                let color = self.last_run_color(&name).unwrap_or(Color32::DARK_GRAY);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("●").color(color));
                     if ui.selectable_label(self.selected == Some(index), RichText::new(&name).strong()).clicked() {
                         self.selected = Some(index);
                         self.selected_run = None;
-                        self.release_tag = None;
+                        self.release_bump = None;
                     }
                 });
                 match self.statuses.get(&path) {
@@ -280,17 +316,28 @@ impl App {
         }
         ui.separator();
 
-        let blocker = if project.test_command.trim().is_empty() {
-            Some("Set a test command in Settings first. It's the gate every run has to pass.")
-        } else if !status.has_origin && self.statuses.contains_key(&project.path) {
-            Some("This repo has no origin remote, so the pipeline has nowhere to push.")
+        let known = self.statuses.contains_key(&project.path);
+        let needs_makefile = known && status.has_origin && !status.has_makefile;
+        let blocker = if known && !status.has_origin {
+            Some("This repo has no origin remote, so the pipeline has nowhere to push.".to_string())
+        } else if needs_makefile {
+            Some(format!("origin/{} has no Makefile, and `make test` is what every run has to pass.", project.default_branch))
         } else if self.claude.is_none() {
-            Some("Could not find the claude binary. Set claude_path in config.toml.")
+            Some("Could not find the claude binary. Set claude_path in config.toml.".to_string())
+        } else if let Some(Err(error)) = &self.gh_status {
+            let reason = if error.contains("could not run") { "isn't installed" } else { "isn't logged in" };
+            Some(format!("The GitHub CLI {reason}. It's needed to watch CI and publish releases."))
         } else {
             None
         };
-        if let Some(blocker) = blocker {
+        if let Some(blocker) = &blocker {
             ui.colored_label(AMBER, blocker);
+        }
+        if needs_makefile {
+            let label = format!("Create Makefile and push to {}", project.default_branch);
+            if ui.button(label).on_hover_text("Adds a starter Makefile for this project's language").clicked() {
+                self.start_run(ui.ctx(), project.clone(), RunKind::CreateMakefile);
+            }
         }
 
         ui.add(
@@ -306,19 +353,19 @@ impl App {
                 self.task.clear();
                 self.start_run(ui.ctx(), project.clone(), kind);
             }
-            let destination = match project.push_target {
-                PushTarget::Branch => "a factory/ branch".to_string(),
-                PushTarget::Default => format!("{} directly", project.default_branch),
-            };
-            ui.weak(format!("Agent → {} → commit → push to {destination}", project.test_command.trim()));
+            ui.weak(format!(
+                "Grill → build → {} → merge to {} → publish release",
+                pipeline::TEST_COMMAND,
+                project.default_branch
+            ));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.add_enabled(blocker.is_none(), egui::Button::new("Cut release…")).clicked() {
-                    self.release_tag = Some(git::next_tag(status.latest_tag.as_deref()));
+                    self.release_bump = Some(Bump::Patch);
                 }
             });
         });
 
-        if self.release_tag.is_some() {
+        if self.release_bump.is_some() {
             self.release_prompt(ui, &project);
         }
 
@@ -332,25 +379,25 @@ impl App {
         let mut close = false;
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.label(format!(
-                "Test origin/{} and, if it passes, tag it and push the tag. A pushed tag is public.",
+                "Test origin/{} and, if it passes, bump the version and publish a release. Published releases are public.",
                 project.default_branch
             ));
             ui.horizontal(|ui| {
-                ui.label("Tag");
-                if let Some(tag) = &mut self.release_tag {
-                    ui.add(TextEdit::singleline(tag).desired_width(140.0));
+                if let Some(selected) = &mut self.release_bump {
+                    for bump in [Bump::Patch, Bump::Minor, Bump::Major] {
+                        ui.radio_value(selected, bump, bump.label());
+                    }
                 }
-                let ready = self.release_tag.as_ref().is_some_and(|t| !t.trim().is_empty());
-                confirm = ui.add_enabled(ready, egui::Button::new("Test, tag and push")).clicked();
+                confirm = ui.button("Test, release and publish").clicked();
                 close = ui.button("Cancel").clicked();
             });
         });
         if confirm {
-            if let Some(tag) = self.release_tag.take() {
-                self.start_run(ui.ctx(), project.clone(), RunKind::Release { tag: tag.trim().to_string() });
+            if let Some(bump) = self.release_bump.take() {
+                self.start_run(ui.ctx(), project.clone(), RunKind::Release { bump });
             }
         } else if close {
-            self.release_tag = None;
+            self.release_bump = None;
         }
     }
 
@@ -365,10 +412,14 @@ impl App {
                     changed |= ui.add(edit).changed();
                     ui.end_row();
                 };
-                text_row(ui, "Test command", &mut project.test_command, "Required. The agent can't skip this.");
-                text_row(ui, "Setup command", &mut project.setup_command, "Runs first in each fresh worktree, e.g. npm ci");
-                text_row(ui, "Default branch", &mut project.default_branch, "Runs start from origin/<this>");
-                text_row(ui, "Release command", &mut project.release_command, "Runs after the tag is pushed, with FACTORY_TAG set");
+                text_row(ui, "Setup command", &mut project.setup_command, "Runs in each fresh worktree before the build, e.g. npm ci");
+                text_row(ui, "Default branch", &mut project.default_branch, "Runs start from origin/<this> and merge back into it");
+                text_row(
+                    ui,
+                    "Release command",
+                    &mut project.release_command,
+                    "Only without a release workflow: runs once the draft exists, with FACTORY_TAG set",
+                );
                 text_row(ui, "Model", &mut project.model, "Blank uses Claude Code's default");
                 text_row(
                     ui,
@@ -376,13 +427,6 @@ impl App {
                     &mut project.allowed_tools,
                     "Comma-separated, e.g. Bash(cargo check:*). The factory's denylist still applies.",
                 );
-
-                ui.label("Push to");
-                ui.horizontal(|ui| {
-                    changed |= ui.radio_value(&mut project.push_target, PushTarget::Branch, "New branch").changed();
-                    changed |= ui.radio_value(&mut project.push_target, PushTarget::Default, "Default branch").changed();
-                });
-                ui.end_row();
 
                 ui.label("Agent permissions");
                 egui::ComboBox::from_id_salt("permission_mode")
@@ -463,6 +507,11 @@ impl App {
             let commit = record.commit.as_deref().map(|c| &c[..c.len().min(10)]).unwrap_or("");
             ui.colored_label(GREEN, format!("Pushed {commit} to {target}"));
         }
+        if let Some(url) = &record.release_url {
+            ui.hyperlink_to(format!("Published {}", record.release_tag.as_deref().unwrap_or("release")), url);
+        }
+
+        self.grill_panel(ui, position, &record);
 
         ui.horizontal(|ui| {
             if record.status == RunStatus::Running {
@@ -498,6 +547,67 @@ impl App {
                     ui.add(egui::Label::new(RichText::new(line).monospace()).extend());
                 }
             });
+    }
+
+    /// The Q&A with the grill agent, plus the agreed brief once there is one.
+    fn grill_panel(&mut self, ui: &mut egui::Ui, position: usize, record: &RunRecord) {
+        if !record.transcript.is_empty() || record.brief.is_some() {
+            egui::CollapsingHeader::new("Requirements").id_salt(&record.id).show(ui, |ui| {
+                ScrollArea::vertical().id_salt("requirements").max_height(180.0).show(ui, |ui| {
+                    for exchange in &record.transcript {
+                        for question in &exchange.questions {
+                            ui.label(question);
+                        }
+                        ui.colored_label(BLUE, &exchange.answer);
+                        ui.add_space(4.0);
+                    }
+                    if let Some(brief) = &record.brief {
+                        ui.strong("Agreed solution");
+                        ui.label(brief);
+                    }
+                });
+            });
+        }
+
+        let Some(questions) = &record.questions else { return };
+        let mut reply = None;
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.colored_label(AMBER, "The agent needs answers before it can build.");
+            ScrollArea::vertical().id_salt("questions").max_height(220.0).show(ui, |ui| {
+                for (number, question) in questions.iter().enumerate() {
+                    ui.label(format!("{}. {question}", number + 1));
+                }
+            });
+            ui.add(
+                TextEdit::multiline(&mut self.answer)
+                    .hint_text("Your answers")
+                    .desired_rows(4)
+                    .desired_width(f32::INFINITY),
+            );
+            ui.horizontal(|ui| {
+                let can_send = !self.answer.trim().is_empty();
+                if ui.add_enabled(can_send, egui::Button::new("Send answers")).clicked() {
+                    reply = Some(GrillReply::Answer(self.answer.trim().to_string()));
+                }
+                let hint = "Have the agent settle whatever is left and write the brief";
+                if ui.button("Enough, build it").on_hover_text(hint).clicked() {
+                    let answer = self.answer.trim();
+                    reply = Some(if answer.is_empty() {
+                        GrillReply::Proceed
+                    } else {
+                        GrillReply::Answer(format!("{answer}\n\nThat's everything from me: settle anything still open and write the brief."))
+                    });
+                }
+            });
+        });
+        if let Some(reply) = reply {
+            if let Some(replies) = &self.runs[position].replies {
+                let _ = replies.send(reply);
+            }
+            // Hide them now, so a second click can't send a reply nobody is waiting for.
+            self.runs[position].state.lock().unwrap().record.questions = None;
+            self.answer.clear();
+        }
     }
 
     fn discard(&mut self, position: usize, project: &Project) {
@@ -560,6 +670,9 @@ impl eframe::App for App {
 
         while let Ok((path, status)) = self.status_rx.try_recv() {
             self.statuses.insert(path, status);
+        }
+        while let Ok(status) = self.gh_rx.try_recv() {
+            self.gh_status = Some(status);
         }
         let running = self.running_count();
         // A run just finished, so the repo it pushed from may look different.

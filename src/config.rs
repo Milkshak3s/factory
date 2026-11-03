@@ -8,16 +8,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::git;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PushTarget {
-    /// Push `factory/<run-id>` and leave merging to a person.
-    #[default]
-    Branch,
-    /// Rebase onto the default branch, re-test if it moved, and push straight to it.
-    Default,
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Project {
@@ -26,10 +16,7 @@ pub struct Project {
     pub default_branch: String,
     /// Runs inside the worktree before anything else, e.g. `npm ci`.
     pub setup_command: String,
-    /// The gate. A project without one can't start a run.
-    pub test_command: String,
-    pub push_target: PushTarget,
-    /// Runs after the tag is pushed, with the tag in `FACTORY_TAG`.
+    /// For projects with no release workflow: runs once the draft exists, with the tag in `FACTORY_TAG`.
     pub release_command: String,
     pub model: String,
     pub permission_mode: String,
@@ -44,8 +31,6 @@ impl Default for Project {
             path: PathBuf::new(),
             default_branch: "main".to_string(),
             setup_command: String::new(),
-            test_command: String::new(),
-            push_target: PushTarget::Branch,
             release_command: String::new(),
             model: String::new(),
             permission_mode: "acceptEdits".to_string(),
@@ -64,7 +49,6 @@ impl Project {
                 .unwrap_or_else(|| path.display().to_string()),
             path: path.to_path_buf(),
             default_branch: git::default_branch(path),
-            test_command: detect_test_command(path).to_string(),
             ..Default::default()
         }
     }
@@ -75,21 +59,6 @@ impl Project {
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
             .collect()
-    }
-}
-
-fn detect_test_command(path: &Path) -> &'static str {
-    let has = |file: &str| path.join(file).exists();
-    if has("Cargo.toml") {
-        "cargo test"
-    } else if has("package.json") {
-        "npm test"
-    } else if has("go.mod") {
-        "go test ./..."
-    } else if has("pyproject.toml") || has("pytest.ini") || has("tests") {
-        "python -m pytest"
-    } else {
-        ""
     }
 }
 
@@ -170,8 +139,7 @@ mod tests {
             claude_path: None,
             projects: vec![Project {
                 name: "demo".into(),
-                test_command: "cargo test".into(),
-                push_target: PushTarget::Default,
+                model: "haiku".into(),
                 ..Default::default()
             }],
         };
@@ -189,10 +157,10 @@ mod tests {
     }
 
     #[test]
-    fn detects_test_command_from_manifest() {
+    fn settings_from_older_versions_are_ignored() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(detect_test_command(dir.path()), "");
-        fs::write(dir.path().join("Cargo.toml"), "").unwrap();
-        assert_eq!(detect_test_command(dir.path()), "cargo test");
+        let file = dir.path().join("config.toml");
+        fs::write(&file, "[[projects]]\nname = \"x\"\ntest_command = \"cargo test\"\npush_target = \"branch\"\n").unwrap();
+        assert_eq!(Config::load(&file).unwrap().projects[0].name, "x");
     }
 }
