@@ -31,8 +31,12 @@ Successful runs clean up their worktree. Failed ones keep it for inspection unti
 - After the agent stops, the run fails if `HEAD` moved or the branch changed.
 
 This is not a sandbox. A determined agent could still undo the push block, or edit test files so
-they pass. With the default `acceptEdits` mode it can't run shell commands unless you allow them
-under *Allowed tools*; `bypassPermissions` removes that limit, so use it with care.
+they pass.
+
+The default `acceptEdits` mode still lets the agent run some shell commands. In testing, `whoami`,
+`git status` and `python --version` ran, while `cargo --version` and `curl --version` were refused.
+Add what it needs under *Allowed tools*, such as `Bash(cargo check:*)`, so it can compile its own
+work. `bypassPermissions` removes the limit entirely, so use it with care.
 
 ## Setup
 
