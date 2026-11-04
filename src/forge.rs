@@ -42,13 +42,18 @@ pub struct GhCli {
 
 /// Finds `gh` on PATH or, since a fresh install doesn't reach a running app's PATH, where it installs.
 pub fn locate_gh() -> PathBuf {
+    let names = gh_names(cfg!(windows));
     let on_path = std::env::var_os("PATH").and_then(|path| {
         std::env::split_paths(&path)
-            .flat_map(|dir| [dir.join("gh.exe"), dir.join("gh")])
+            .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
             .find(|candidate| candidate.is_file())
     });
     let installed = PathBuf::from(r"C:\Program Files\GitHub CLI\gh.exe");
-    on_path.unwrap_or_else(|| if installed.is_file() { installed } else { PathBuf::from("gh") })
+    on_path.unwrap_or_else(|| if cfg!(windows) && installed.is_file() { installed } else { PathBuf::from("gh") })
+}
+
+fn gh_names(windows: bool) -> &'static [&'static str] {
+    if windows { &["gh.exe", "gh"] } else { &["gh"] }
 }
 
 impl GhCli {
@@ -122,6 +127,12 @@ fn parse_runs(text: &str) -> Result<Option<WorkflowRun>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_windows_looks_for_an_exe() {
+        assert_eq!(gh_names(true), ["gh.exe", "gh"]);
+        assert_eq!(gh_names(false), ["gh"]);
+    }
 
     #[test]
     fn parses_workflow_runs() {

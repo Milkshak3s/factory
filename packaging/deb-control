@@ -1,0 +1,12 @@
+Package: factory
+Version: @VERSION@
+Architecture: amd64
+Maintainer: Milkshak3s <Milkshak3s@users.noreply.github.com>
+Section: devel
+Priority: optional
+Homepage: https://github.com/Milkshak3s/factory
+Depends: git, make, libc6, libgl1, libegl1, libxkbcommon0, libx11-6, libxcursor1, libxi6, libxrandr2, libwayland-client0
+Description: Takes a prompt all the way to a published release
+ A desktop list of the projects you need to be able to change quickly, and a
+ pipeline where agents write the brief and the code, and the factory runs
+ everything around them.

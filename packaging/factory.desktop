@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Factory
+Comment=Take a prompt all the way to a published release
+Exec=factory
+Icon=factory
+Terminal=false
+Categories=Development;
+StartupWMClass=factory

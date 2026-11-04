@@ -1,5 +1,6 @@
-# Builds the MSI and leaves it on a draft release. The pipeline pushes to `release`, waits for this
-# workflow, then sets the notes and publishes the draft.
+# Builds the installers for every platform and leaves them on one draft release. The pipeline pushes
+# to `release`, waits for this workflow, then sets the notes and publishes the draft. A failure on any
+# platform fails the whole run, so a release never goes out with assets missing.
 name: Release
 
 on:
@@ -13,10 +14,14 @@ env:
   WIX_VERSION: 6.0.2
   # Lets the pinned WiX tool run on whichever newer .NET runtime the runner has.
   DOTNET_ROLL_FORWARD: Major
+  # The tag on AppImage/AppImageKit that packaging/appimage.sh downloads.
+  APPIMAGETOOL_VERSION: "13"
 
 jobs:
-  msi:
+  windows:
     runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     defaults:
       run:
         shell: pwsh
@@ -41,6 +46,21 @@ jobs:
           if (-not $version) { throw 'Could not read the version from Cargo.toml' }
           "version=$version" >> $env:GITHUB_OUTPUT
 
+      - name: Set a git identity for the tests
+        run: |
+          git config --global user.name "factory-ci"
+          git config --global user.email "factory-ci@users.noreply.github.com"
+
+      - name: Make sure make is installed
+        run: |
+          if (-not (Get-Command make -ErrorAction SilentlyContinue)) {
+            choco install make --no-progress -y
+            if ($LASTEXITCODE -ne 0) { throw 'Could not install make' }
+          }
+
+      - name: Test
+        run: cargo test --locked
+
       - name: Build
         run: cargo build --release --locked
 
@@ -57,14 +77,134 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           wix build wix/main.wxs -arch x64 -d "Version=$version" -d "ExePath=target\release\factory.exe" -d "IconPath=target\release\factory.ico" -o "dist\factory-$version-x64.msi"
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: factory-windows
+          path: dist/*
+          if-no-files-found: error
+
+  macos:
+    # macos-latest is arm64.
+    runs-on: macos-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update Rust
+        run: rustup update stable --no-self-update
+
+      - name: Use stable Rust
+        run: rustup default stable
+
+      - name: Read the version
+        id: version
+        run: |
+          version=$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[0].version')
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Set a git identity for the tests
+        run: |
+          git config --global user.name "factory-ci"
+          git config --global user.email "factory-ci@users.noreply.github.com"
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Build the DMG
+        run: bash packaging/macos.sh "${{ steps.version.outputs.version }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: factory-macos
+          path: dist/*
+          if-no-files-found: error
+
+  linux:
+    # The oldest hosted image, so the binary asks for as old a glibc as possible.
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the egui build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev libegl1-mesa-dev libwayland-dev
+
+      - name: Update Rust
+        run: rustup update stable --no-self-update
+
+      - name: Use stable Rust
+        run: rustup default stable
+
+      - name: Read the version
+        id: version
+        run: |
+          version=$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[0].version')
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Set a git identity for the tests
+        run: |
+          git config --global user.name "factory-ci"
+          git config --global user.email "factory-ci@users.noreply.github.com"
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Build the AppImage
+        run: bash packaging/appimage.sh "${{ steps.version.outputs.version }}"
+
+      - name: Build the .deb
+        run: bash packaging/deb.sh "${{ steps.version.outputs.version }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: factory-linux
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: [windows, macos, linux]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
       - name: Create the draft release
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.version.outputs.version }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.windows.outputs.version }}
         run: |
-          $version = $env:VERSION
-          $msi = "dist\factory-$version-x64.msi"
-          if (-not (Test-Path -LiteralPath $msi) -or (Get-Item -LiteralPath $msi).Length -eq 0) {
-            throw "$msi was not produced"
-          }
-          gh release create "v$version" $msi --draft --target $env:GITHUB_SHA --title "factory v$version" --notes "Release notes pending."
+          version="$VERSION"
+          test -n "$version"
+          assets=(
+            "dist/factory-$version-x64.msi"
+            "dist/factory-$version-arm64.dmg"
+            "dist/factory-$version-x64.AppImage"
+            "dist/factory-$version-x64.deb"
+          )
+          for asset in "${assets[@]}"; do
+            if [ ! -s "$asset" ]; then
+              echo "$asset was not produced" >&2
+              exit 1
+            fi
+          done
+          gh release create "v$version" "${assets[@]}" --draft --target "$GITHUB_SHA" --title "factory v$version" --notes "Release notes pending."

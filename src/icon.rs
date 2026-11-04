@@ -1,11 +1,15 @@
 //! Factory's icon, drawn in code: a factory silhouette on an orange rounded square.
 //!
 //! The app renders it for its window, and `build.rs` compiles this same file to produce the icon
-//! embedded in the exe and the one the MSI uses. Sizes are in pixels and images are top-down,
-//! unpremultiplied RGBA.
+//! embedded in the exe and the ones the MSI, the macOS app and the Linux packages use. Sizes are in
+//! pixels and images are top-down, unpremultiplied RGBA.
 
 /// The sizes in the `.ico` and in the exe, largest first.
 pub const ICON_SIZES: [u32; 8] = [256, 64, 48, 40, 32, 24, 20, 16];
+/// The size of the Linux packages' `.png`.
+pub const PNG_SIZE: u32 = 256;
+/// The entries in the `.icns`: each one's type code and the size of its PNG.
+pub const ICNS_ENTRIES: [([u8; 4], u32); 4] = [(*b"ic07", 128), (*b"ic08", 256), (*b"ic09", 512), (*b"ic10", 1024)];
 
 const SUPERSAMPLE: u32 = 4;
 /// Below this the windows are mush, so the smallest sizes are the bare silhouette.
@@ -215,9 +219,195 @@ pub fn encode_res(images: &[(u32, Vec<u8>)]) -> Vec<u8> {
     res
 }
 
+const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+/// The most a stored deflate block can hold.
+const MAX_STORED_BLOCK: usize = 0xFFFF;
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
+fn adler32(bytes: &[u8]) -> u32 {
+    let (mut a, mut b) = (1u32, 0u32);
+    for &byte in bytes {
+        a = (a + u32::from(byte)) % 65521;
+        b = (b + a) % 65521;
+    }
+    (b << 16) | a
+}
+
+/// A zlib stream of stored deflate blocks, which is valid without compressing anything.
+fn zlib_stored(data: &[u8]) -> Vec<u8> {
+    let mut stream: Vec<u8> = vec![0x78, 0x01];
+    let mut blocks = data.chunks(MAX_STORED_BLOCK).peekable();
+    if blocks.peek().is_none() {
+        stream.extend([1, 0, 0, 0xFF, 0xFF]);
+    }
+    while let Some(block) = blocks.next() {
+        let is_last = blocks.peek().is_none();
+        let len = block.len() as u16;
+        stream.push(u8::from(is_last));
+        stream.extend(len.to_le_bytes());
+        stream.extend((!len).to_le_bytes());
+        stream.extend(block);
+    }
+    stream.extend(adler32(data).to_be_bytes());
+    stream
+}
+
+fn push_png_chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    png.extend((data.len() as u32).to_be_bytes());
+    let start = png.len();
+    png.extend(kind);
+    png.extend(data);
+    let crc = crc32(&png[start..]);
+    png.extend(crc.to_be_bytes());
+}
+
+/// Encodes an image as an 8-bit RGBA PNG. It isn't compressed, which keeps this free of dependencies.
+pub fn encode_png(size: u32, rgba: &[u8]) -> Vec<u8> {
+    let mut header = Vec::with_capacity(13);
+    header.extend(size.to_be_bytes());
+    header.extend(size.to_be_bytes());
+    // 8 bits per channel, RGBA, then the only compression and filter methods, and no interlacing.
+    header.extend([8, 6, 0, 0, 0]);
+
+    let stride = size as usize * 4;
+    let mut filtered: Vec<u8> = Vec::with_capacity(rgba.len() + size as usize);
+    for row in rgba.chunks_exact(stride) {
+        // Each row starts with its filter type, and 0 means unfiltered.
+        filtered.push(0);
+        filtered.extend(row);
+    }
+
+    let mut png = PNG_SIGNATURE.to_vec();
+    push_png_chunk(&mut png, b"IHDR", &header);
+    push_png_chunk(&mut png, b"IDAT", &zlib_stored(&filtered));
+    push_png_chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+/// Builds a `.icns` file from (type code, PNG) pairs. Its lengths are big-endian and include the
+/// 8-byte header of whatever they measure.
+pub fn encode_icns(entries: &[([u8; 4], Vec<u8>)]) -> Vec<u8> {
+    let total = 8 + entries.iter().map(|(_, data)| 8 + data.len()).sum::<usize>();
+    let mut icns = Vec::with_capacity(total);
+    icns.extend(b"icns");
+    icns.extend((total as u32).to_be_bytes());
+    for (kind, data) in entries {
+        icns.extend(kind);
+        icns.extend(((8 + data.len()) as u32).to_be_bytes());
+        icns.extend(data);
+    }
+    icns
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn u32_be_at(bytes: &[u8], at: usize) -> u32 {
+        u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+    }
+
+    /// Reads a zlib stream of stored blocks back, checking each block's length and the checksum.
+    fn inflate_stored(stream: &[u8]) -> Vec<u8> {
+        assert_eq!(u16::from_be_bytes([stream[0], stream[1]]) % 31, 0, "zlib header check");
+        let mut data: Vec<u8> = Vec::new();
+        let mut at = 2;
+        loop {
+            let is_last = stream[at] == 1;
+            let len = u16_at(stream, at + 1);
+            assert_eq!(u16_at(stream, at + 3), !len);
+            data.extend(&stream[at + 5..at + 5 + len as usize]);
+            at += 5 + len as usize;
+            if is_last {
+                break;
+            }
+        }
+        assert_eq!(at + 4, stream.len());
+        assert_eq!(u32_be_at(stream, at), adler32(&data));
+        data
+    }
+
+    #[test]
+    fn checksums_match_known_values() {
+        assert_eq!(crc32(b"IEND"), 0xAE42_6082);
+        assert_eq!(adler32(b"Wikipedia"), 0x11E6_0398);
+    }
+
+    #[test]
+    fn stored_streams_read_back_whatever_their_size() {
+        let long: Vec<u8> = (0..MAX_STORED_BLOCK * 2 + 10).map(|i| (i % 251) as u8).collect();
+        let cases: [&[u8]; 3] = [&[], &[1, 2, 3], &long];
+        for data in cases {
+            assert_eq!(inflate_stored(&zlib_stored(data)), data);
+        }
+    }
+
+    #[test]
+    fn png_has_a_valid_structure_and_holds_the_image() {
+        let size = 200;
+        let rgba = render(size);
+        let png = encode_png(size, &rgba);
+        assert_eq!(png[..8], PNG_SIGNATURE);
+
+        let mut chunks = Vec::new();
+        let mut at = 8;
+        while at < png.len() {
+            let len = u32_be_at(&png, at) as usize;
+            assert_eq!(u32_be_at(&png, at + 8 + len), crc32(&png[at + 4..at + 8 + len]));
+            chunks.push((&png[at + 4..at + 8], &png[at + 8..at + 8 + len]));
+            at += 12 + len;
+        }
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].0, b"IHDR");
+        assert_eq!(chunks[1].0, b"IDAT");
+        assert_eq!(chunks[2].0, b"IEND");
+        assert!(chunks[2].1.is_empty());
+
+        let header = chunks[0].1;
+        assert_eq!((u32_be_at(header, 0), u32_be_at(header, 4)), (size, size));
+        assert_eq!(header[8..], [8, 6, 0, 0, 0]);
+
+        let filtered = inflate_stored(chunks[1].1);
+        let rows: Vec<&[u8]> = filtered.chunks_exact(size as usize * 4 + 1).collect();
+        assert_eq!(rows.len(), size as usize);
+        for (row, expected) in rows.iter().zip(rgba.chunks_exact(size as usize * 4)) {
+            assert_eq!(row[0], 0);
+            assert_eq!(&row[1..], expected);
+        }
+    }
+
+    #[test]
+    fn icns_entries_are_big_endian_and_add_up_to_the_file() {
+        let entries = [(*b"ic07", vec![1, 2, 3]), (*b"ic08", vec![4])];
+        let icns = encode_icns(&entries);
+        assert_eq!(&icns[..4], b"icns");
+        assert_eq!(u32_be_at(&icns, 4) as usize, icns.len());
+
+        assert_eq!(&icns[8..12], b"ic07");
+        assert_eq!(u32_be_at(&icns, 12), 8 + 3);
+        assert_eq!(icns[16..19], [1, 2, 3]);
+        assert_eq!(&icns[19..23], b"ic08");
+        assert_eq!(u32_be_at(&icns, 23), 8 + 1);
+        assert_eq!(icns[27], 4);
+        assert_eq!(icns.len(), 28);
+    }
+
+    #[test]
+    fn icns_covers_the_retina_sizes() {
+        let sizes = ICNS_ENTRIES.map(|(_, size)| size);
+        assert_eq!(sizes, [128, 256, 512, 1024]);
+        assert_eq!(ICNS_ENTRIES[3].0, *b"ic10");
+    }
 
     fn dibs() -> Vec<(u32, Vec<u8>)> {
         [32, 16]

@@ -120,7 +120,7 @@ pub struct App {
     build_bump: Bump,
     notice: Option<String>,
     running_last_frame: usize,
-    /// Only set when running from the MSI's install folder.
+    /// Only set when running from an installed copy.
     updater: Option<Updater>,
 }
 
@@ -235,11 +235,11 @@ impl App {
                     Step::Downloading => {
                         ui.add_enabled(false, egui::Button::new("Downloading…"));
                     }
-                    Step::Confirm(msi) => {
+                    Step::Confirm(package) => {
                         ui.colored_label(AMBER, update::confirm_text(running));
                         let label = if running > 0 { "Update anyway" } else { "Update now" };
                         if ui.button(label).clicked() {
-                            if let Err(error) = updater.install(ui.ctx(), &msi) {
+                            if let Err(error) = updater.install(ui.ctx(), &package) {
                                 self.notice = Some(error);
                             }
                         }
@@ -820,7 +820,13 @@ fn chip_text(record: &RunRecord, stage: Stage) -> RichText {
 }
 
 fn open_folder(path: &std::path::Path) {
-    let opener = if cfg!(windows) { "explorer" } else { "xdg-open" };
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(windows) {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
     let _ = command(opener).arg(path).spawn();
 }
 

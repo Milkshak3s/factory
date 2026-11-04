@@ -1,4 +1,5 @@
-//! Embeds the icon in the exe, and leaves `factory.ico` beside it for the MSI build.
+//! Leaves the icon the installers need beside the binary: `factory.ico` for the MSI, which is also
+//! embedded in the exe, `factory.icns` for the macOS app, and `factory.png` for the Linux packages.
 
 #[path = "src/icon.rs"]
 mod icon;
@@ -10,11 +11,6 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/icon.rs");
 
-    let images: Vec<(u32, Vec<u8>)> = icon::ICON_SIZES
-        .iter()
-        .map(|&size| (size, icon::encode_dib(size, &icon::render(size))))
-        .collect();
-
     let out_dir = env::var("OUT_DIR").expect("cargo sets OUT_DIR");
     let out_dir = Path::new(&out_dir);
 
@@ -23,6 +19,32 @@ fn main() {
         .ancestors()
         .nth(3)
         .expect("OUT_DIR is inside the target directory");
+
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    match target_os.as_str() {
+        "windows" => windows_icons(out_dir, profile_dir),
+        "macos" => {
+            let entries: Vec<([u8; 4], Vec<u8>)> = icon::ICNS_ENTRIES
+                .iter()
+                .map(|&(kind, size)| (kind, icon::encode_png(size, &icon::render(size))))
+                .collect();
+            fs::write(profile_dir.join("factory.icns"), icon::encode_icns(&entries))
+                .expect("write factory.icns");
+        }
+        _ => {
+            let size = icon::PNG_SIZE;
+            fs::write(profile_dir.join("factory.png"), icon::encode_png(size, &icon::render(size)))
+                .expect("write factory.png");
+        }
+    }
+}
+
+fn windows_icons(out_dir: &Path, profile_dir: &Path) {
+    let images: Vec<(u32, Vec<u8>)> = icon::ICON_SIZES
+        .iter()
+        .map(|&size| (size, icon::encode_dib(size, &icon::render(size))))
+        .collect();
+
     fs::write(profile_dir.join("factory.ico"), icon::encode_ico(&images))
         .expect("write factory.ico");
 

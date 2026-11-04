@@ -25,11 +25,16 @@ fn window_icon() -> eframe::egui::IconData {
 }
 
 fn main() -> eframe::Result {
+    // First, because changing the environment is only sound before other threads exist.
+    proc::adopt_login_path();
+
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
             .with_min_inner_size([800.0, 500.0])
-            .with_icon(window_icon()),
+            .with_icon(window_icon())
+            // Lets Linux desktops match the window to packaging/factory.desktop.
+            .with_app_id("factory"),
         ..Default::default()
     };
     eframe::run_native("Factory", options, Box::new(|cc| Ok(Box::new(app::App::new(cc)))))

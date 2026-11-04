@@ -32,17 +32,29 @@ with your questions. You can't change any files.";
 
 const GRILL_SCHEMA: &str = r#"{"type":"object","properties":{"status":{"type":"string","enum":["questions","ready"]},"questions":{"type":"array","items":{"type":"object","properties":{"text":{"type":"string"},"options":{"type":"array","items":{"type":"string"}},"recommended":{"type":"integer","minimum":0}},"required":["text"]}},"title":{"type":"string"},"brief":{"type":"string"},"bump":{"type":"string","enum":["patch","minor","major"]}},"required":["status"],"if":{"properties":{"status":{"const":"ready"}}},"then":{"required":["title","brief","bump"]}}"#;
 
-const MAKEFILE_RULES: &str = "You are setting up a software factory's test gate for this project. \
+const MAKEFILE_RULES_START: &str = "You are setting up a software factory's test gate for this project. \
 Read the project, including any CI workflows and scripts, to learn how it is really built and \
 tested. Then write a GNU Makefile in the project root and change no other file. Its `test` target \
 is the gate every future change has to pass, so it must run the project's complete test suite, \
 exiting non-zero on any failure. Never make it a no-op, and never ignore failures. If CI runs more \
 than one test command, run them all. Also add targets for the project's other common tasks, such as \
-build and lint, and a short comment at the top listing them. Recipes run on Windows, under either \
-cmd.exe or a POSIX sh, so use commands that work in both. If the project has no tests at all, write \
+build and lint, and a short comment at the top listing them.";
+
+const MAKEFILE_SHELL_WINDOWS: &str = "Recipes run on Windows, under either cmd.exe or a POSIX sh, so use \
+commands that work in both.";
+
+const MAKEFILE_SHELL_POSIX: &str = "Recipes run under a POSIX sh.";
+
+const MAKEFILE_RULES_END: &str = "If the project has no tests at all, write \
 a `test` target that prints that and exits non-zero, and return has_tests false; otherwise return \
 has_tests true. The factory runs `make test` after you stop, and commits and pushes the result. You \
 can't run commands yourself.";
+
+/// The Makefile agent's rules, describing the shell that recipes run under on this host.
+fn makefile_rules(windows: bool) -> String {
+    let shell = if windows { MAKEFILE_SHELL_WINDOWS } else { MAKEFILE_SHELL_POSIX };
+    format!("{MAKEFILE_RULES_START} {shell} {MAKEFILE_RULES_END}")
+}
 
 const MAKEFILE_SCHEMA: &str = r#"{"type":"object","properties":{"has_tests":{"type":"boolean"}},"required":["has_tests"]}"#;
 
@@ -132,7 +144,7 @@ impl ClaudeCli {
                 "--tools",
                 "Read,Grep,Glob,Write,Edit",
                 "--append-system-prompt",
-                MAKEFILE_RULES,
+                makefile_rules(cfg!(windows)).as_str(),
                 "--json-schema",
                 MAKEFILE_SCHEMA,
             ]),
@@ -256,15 +268,14 @@ fn describe_block(block: &Value) -> Option<String> {
     }
 }
 
-/// Finds `claude`: the configured path, then PATH, then the desktop app's bundled copy.
+/// Finds `claude`: the configured path, then PATH, then on Windows the desktop app's bundled copy.
 pub fn locate_claude(configured: Option<&Path>) -> Option<PathBuf> {
     if let Some(path) = configured {
         return Some(path.to_path_buf());
     }
-    let names = ["claude.exe", "claude.cmd", "claude"];
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
-            for name in names {
+            for name in claude_names(cfg!(windows)) {
                 let candidate = dir.join(name);
                 if candidate.is_file() {
                     return Some(candidate);
@@ -272,8 +283,15 @@ pub fn locate_claude(configured: Option<&Path>) -> Option<PathBuf> {
             }
         }
     }
+    if !cfg!(windows) {
+        return None;
+    }
     let bundled = PathBuf::from(std::env::var_os("APPDATA")?).join("Claude").join("claude-code");
     newest_bundled(&bundled)
+}
+
+fn claude_names(windows: bool) -> &'static [&'static str] {
+    if windows { &["claude.exe", "claude.cmd", "claude"] } else { &["claude"] }
 }
 
 /// The desktop app keeps copies at `<version>/<hash>/claude.exe`; take the most recent.
@@ -347,6 +365,24 @@ mod tests {
         assert!(!args.iter().any(|a| a == "bypassPermissions" || a == "Bash(cargo:*)"));
         let schema: Value = serde_json::from_str(MAKEFILE_SCHEMA).unwrap();
         assert_eq!(schema["required"][0], "has_tests");
+    }
+
+    #[test]
+    fn the_makefile_rules_describe_the_hosts_shell() {
+        let windows = makefile_rules(true);
+        assert!(windows.contains("under either cmd.exe or a POSIX sh"));
+        assert!(!windows.contains("Recipes run under a POSIX sh"));
+
+        let unix = makefile_rules(false);
+        assert!(unix.contains("listing them. Recipes run under a POSIX sh. If the project has no tests"));
+        assert!(!unix.contains("cmd.exe"));
+        assert!(!unix.contains("Windows"));
+    }
+
+    #[test]
+    fn only_windows_looks_for_an_exe_or_a_cmd() {
+        assert_eq!(claude_names(true), ["claude.exe", "claude.cmd", "claude"]);
+        assert_eq!(claude_names(false), ["claude"]);
     }
 
     #[test]

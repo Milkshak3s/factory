@@ -1,0 +1,4 @@
+#!/bin/sh
+# Leaves the library search path alone, because anything set here would leak into git, make and claude.
+here="$(dirname "$(readlink -f "$0")")"
+exec "$here/usr/bin/factory" "$@"

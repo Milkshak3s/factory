@@ -97,8 +97,16 @@ pub struct Paths {
 
 impl Paths {
     pub fn locate() -> Self {
-        let env_dir = |name: &str| std::env::var_os(name).map(PathBuf::from);
+        Self::choose(cfg!(target_os = "macos"), &|name| std::env::var_os(name).map(PathBuf::from))
+    }
+
+    /// Picks the locations from the platform and a way to read environment variables.
+    fn choose(macos: bool, env_dir: &dyn Fn(&str) -> Option<PathBuf>) -> Self {
         let home = env_dir("USERPROFILE").or_else(|| env_dir("HOME")).unwrap_or_default();
+        if macos {
+            let support = home.join("Library").join("Application Support").join("factory");
+            return Self { config_file: support.join("config.toml"), data_dir: support };
+        }
         let config = env_dir("APPDATA").unwrap_or_else(|| home.join(".config"));
         let data = env_dir("LOCALAPPDATA").unwrap_or_else(|| home.join(".local").join("share"));
         Self {
@@ -133,6 +141,39 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn paths_with(macos: bool, vars: &[(&str, &str)]) -> Paths {
+        Paths::choose(macos, &|name| {
+            vars.iter().find(|(key, _)| *key == name).map(|(_, value)| PathBuf::from(value))
+        })
+    }
+
+    #[test]
+    fn macos_keeps_everything_in_application_support() {
+        let paths = paths_with(true, &[("HOME", "/Users/jo")]);
+        let support = Path::new("/Users/jo").join("Library").join("Application Support").join("factory");
+        assert_eq!(paths.config_file, support.join("config.toml"));
+        assert_eq!(paths.data_dir, support);
+    }
+
+    #[test]
+    fn linux_uses_the_dot_directories_under_home() {
+        let paths = paths_with(false, &[("HOME", "/home/jo")]);
+        assert_eq!(paths.config_file, Path::new("/home/jo").join(".config").join("factory").join("config.toml"));
+        assert_eq!(paths.data_dir, Path::new("/home/jo").join(".local").join("share").join("factory"));
+    }
+
+    #[test]
+    fn windows_uses_its_app_data_folders() {
+        let vars = [
+            ("USERPROFILE", r"C:\Users\Jo"),
+            ("APPDATA", r"C:\Users\Jo\AppData\Roaming"),
+            ("LOCALAPPDATA", r"C:\Users\Jo\AppData\Local"),
+        ];
+        let paths = paths_with(false, &vars);
+        assert_eq!(paths.config_file, Path::new(r"C:\Users\Jo\AppData\Roaming").join("factory").join("config.toml"));
+        assert_eq!(paths.data_dir, Path::new(r"C:\Users\Jo\AppData\Local").join("factory"));
+    }
 
     #[test]
     fn config_round_trips_through_toml() {
