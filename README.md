@@ -30,6 +30,13 @@ Prepare → Grill → Branch → Build ⇄ Test → Commit → Merge → Release
    radio buttons if the grill was skipped.
 7. **Publish:** promotes the draft to published, once the release process has finished.
 
+While a run is going, a line under the stages says what it's waiting on right now, such as
+``Waiting for `make test` `` or `Waiting for the build agent (attempt 2 of 3)`, with a timer that
+restarts for each new wait. During the release workflow it also links to the run on GitHub. When
+a run needs your answers, its dot in the run list and its project's dot turn amber, even if a newer
+run is going on the same project. Every other wait, CI included, stays blue. Hover over a dot to see
+the wait.
+
 *Cut release…* runs Test → Release → Publish on its own, for when there's no code to change.
 
 Successful runs clean up their worktree. Failed ones keep it for inspection until you discard it.

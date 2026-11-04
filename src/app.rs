@@ -7,6 +7,7 @@ use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, FixedOffset, Local};
 use eframe::egui::{self, Color32, RichText, ScrollArea, TextEdit};
 
 use crate::agent::{Agent, ClaudeCli, locate_claude};
@@ -21,6 +22,8 @@ use crate::version::Bump;
 const REFRESH_EVERY: Duration = Duration::from_secs(30);
 const EXIT_GRACE: Duration = Duration::from_secs(5);
 const WORKFLOW_POLL: Duration = Duration::from_secs(15);
+/// Room kept beside a wait's label for its timer and link, so a long command can't push them away.
+const WAIT_TRAILING_WIDTH: f32 = 130.0;
 
 const GREEN: Color32 = Color32::from_rgb(70, 170, 100);
 const RED: Color32 = Color32::from_rgb(215, 85, 80);
@@ -141,6 +144,45 @@ fn status_label(status: RunStatus) -> &'static str {
         RunStatus::Cancelled => "Cancelled",
         RunStatus::Interrupted => "Interrupted",
     }
+}
+
+/// A run's dot: amber if it wants an answer. Waits that need nothing from the user stay blue.
+fn run_dot_color(record: &RunRecord) -> Color32 {
+    if record.questions.is_some() { AMBER } else { status_color(record.status) }
+}
+
+fn wait_label(record: &RunRecord) -> Option<&str> {
+    record.waiting_on.as_ref().map(|wait| wait.label.as_str())
+}
+
+/// A project's dot and tooltip, given its runs newest first. Any run wanting an answer turns it
+/// amber, even behind a newer run. Otherwise it follows the latest run. `None` if there are no runs.
+fn project_dot(records: &[RunRecord]) -> Option<(Color32, Option<String>)> {
+    let latest = records.first()?;
+    Some(match records.iter().find(|record| record.questions.is_some()) {
+        Some(asking) => (AMBER, wait_label(asking).map(str::to_string)),
+        None => (run_dot_color(latest), wait_label(latest).map(str::to_string)),
+    })
+}
+
+fn dot(ui: &mut egui::Ui, color: Color32, tooltip: Option<&str>) {
+    let response = ui.label(RichText::new("●").color(color));
+    if let Some(tooltip) = tooltip {
+        response.on_hover_text(tooltip);
+    }
+}
+
+/// How long ago `since` was, as `42s`, `3m 07s` or `1h 02m`. `None` if `since` can't be read.
+fn elapsed_text(since: &str, now: DateTime<FixedOffset>) -> Option<String> {
+    let since = DateTime::parse_from_rfc3339(since).ok()?;
+    let seconds = now.signed_duration_since(since).num_seconds().max(0);
+    Some(if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {:02}m", seconds / 3600, seconds / 60 % 60)
+    })
 }
 
 /// The stages *Run pipeline* will go through, shown beside the button.
@@ -360,15 +402,17 @@ impl App {
         self.runs.iter().filter(|r| r.state.lock().unwrap().record.status == RunStatus::Running).count()
     }
 
-    /// The color for a project's dot: its latest run, or amber if that run wants an answer.
-    fn last_run_color(&self, name: &str) -> Option<Color32> {
-        self.runs.iter().find_map(|run| {
-            let state = run.state.lock().unwrap();
-            let record = &state.record;
-            (record.project == name).then(|| {
-                if record.questions.is_some() { AMBER } else { status_color(record.status) }
+    /// The color and tooltip for a project's dot, or `None` if it has no runs yet.
+    fn project_dot(&self, name: &str) -> Option<(Color32, Option<String>)> {
+        let records: Vec<RunRecord> = self
+            .runs
+            .iter()
+            .filter_map(|run| {
+                let state = run.state.lock().unwrap();
+                (state.record.project == name).then(|| state.record.clone())
             })
-        })
+            .collect();
+        project_dot(&records)
     }
 
     fn project_list(&mut self, ui: &mut egui::Ui) {
@@ -394,9 +438,9 @@ impl App {
                     let project = &self.config.projects[index];
                     (project.name.clone(), project.path.clone())
                 };
-                let color = self.last_run_color(&name).unwrap_or(Color32::DARK_GRAY);
+                let (color, tooltip) = self.project_dot(&name).unwrap_or((Color32::DARK_GRAY, None));
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("●").color(color));
+                    dot(ui, color, tooltip.as_deref());
                     if ui.selectable_label(self.selected == Some(index), RichText::new(&name).strong()).clicked() {
                         self.selected = Some(index);
                         self.selected_run = None;
@@ -614,7 +658,7 @@ impl App {
                 for record in &records {
                     let selected = self.selected_run.as_deref() == Some(record.id.as_str());
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("●").color(status_color(record.status)));
+                        dot(ui, run_dot_color(record), wait_label(record));
                         if ui.selectable_label(selected, truncated(&record.kind.title(), 34)).clicked() {
                             self.selected_run = Some(record.id.clone());
                         }
@@ -642,6 +686,7 @@ impl App {
             ui.strong(record.kind.title());
         });
         stage_strip(ui, &record);
+        wait_row(ui, &record);
 
         if let Some(error) = &record.error {
             ui.colored_label(RED, error);
@@ -740,11 +785,16 @@ impl App {
             });
         });
         if let Some(reply) = reply {
+            // Hide them now, so a second click can't send a reply nobody is waiting for. This comes
+            // before sending so it can't overwrite the wait the pipeline sets once it has the reply.
+            {
+                let mut state = entry.state.lock().unwrap();
+                state.record.questions = None;
+                state.record.waiting_on = None;
+            }
             if let Some(replies) = &entry.replies {
                 let _ = replies.send(reply);
             }
-            // Hide them now, so a second click can't send a reply nobody is waiting for.
-            entry.state.lock().unwrap().record.questions = None;
             entry.drafts.clear();
         }
     }
@@ -799,6 +849,38 @@ fn stage_strip(ui: &mut egui::Ui, record: &RunRecord) {
                 ui.weak("→");
             }
             ui.label(chip_text(record, stage));
+        }
+    });
+}
+
+/// What a running run is waiting on. The row keeps its height with nothing to show, so the log and
+/// buttons below don't jump between stages.
+fn wait_row(ui: &mut egui::Ui, record: &RunRecord) {
+    if record.status != RunStatus::Running {
+        return;
+    }
+    let height = ui.spacing().interact_size.y;
+    let layout = egui::Layout::left_to_right(egui::Align::Center);
+    ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), height), layout, |ui| {
+        ui.set_min_height(height);
+        let Some(wait) = &record.waiting_on else { return };
+        // Every second, or the timer would stand still while waiting on the user: no spinner there.
+        ui.ctx().request_repaint_after(Duration::from_secs(1));
+        let label = if record.questions.is_some() {
+            RichText::new(&wait.label).color(AMBER)
+        } else {
+            ui.spinner();
+            RichText::new(&wait.label)
+        };
+        ui.scope(|ui| {
+            ui.set_max_width((ui.available_width() - WAIT_TRAILING_WIDTH).max(0.0));
+            ui.add(egui::Label::new(label).truncate());
+        });
+        if let Some(elapsed) = elapsed_text(&wait.since, Local::now().fixed_offset()) {
+            ui.weak(elapsed);
+        }
+        if let Some(url) = &wait.url {
+            ui.hyperlink_to("View run", url);
         }
     });
 }
@@ -903,6 +985,7 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::Wait;
 
     #[test]
     fn the_hint_only_mentions_the_grill_when_it_will_run() {
@@ -984,5 +1067,84 @@ mod tests {
             GrillReply::Proceed => panic!("the selections would be lost"),
         }
         assert!(matches!(enough_reply(None), GrillReply::Proceed));
+    }
+
+    fn elapsed(since: &str) -> Option<String> {
+        elapsed_text(since, DateTime::parse_from_rfc3339("2026-01-01T12:00:00+00:00").unwrap())
+    }
+
+    #[test]
+    fn elapsed_time_reads_in_seconds_minutes_or_hours() {
+        assert_eq!(elapsed("2026-01-01T12:00:00+00:00").as_deref(), Some("0s"));
+        assert_eq!(elapsed("2026-01-01T11:59:18+00:00").as_deref(), Some("42s"));
+        assert_eq!(elapsed("2026-01-01T11:59:00+00:00").as_deref(), Some("1m 00s"));
+        assert_eq!(elapsed("2026-01-01T11:56:53+00:00").as_deref(), Some("3m 07s"));
+        assert_eq!(elapsed("2026-01-01T11:00:01+00:00").as_deref(), Some("59m 59s"));
+        assert_eq!(elapsed("2026-01-01T11:00:00+00:00").as_deref(), Some("1h 00m"));
+        assert_eq!(elapsed("2026-01-01T10:57:30+00:00").as_deref(), Some("1h 02m"));
+    }
+
+    #[test]
+    fn elapsed_time_copes_with_other_offsets_future_times_and_junk() {
+        assert_eq!(elapsed("2026-01-01T13:59:18+02:00").as_deref(), Some("42s"));
+        assert_eq!(elapsed("2026-01-01T12:00:30+00:00").as_deref(), Some("0s"), "a future time clamps to zero");
+        assert_eq!(elapsed("not a time"), None);
+        assert_eq!(elapsed(""), None);
+    }
+
+    fn run_record(status: RunStatus, questions: bool, wait: Option<&str>) -> RunRecord {
+        RunRecord {
+            id: "id".into(),
+            project: "demo".into(),
+            kind: RunKind::CreateMakefile,
+            status,
+            plan: Vec::new(),
+            stages: Vec::new(),
+            started_at: String::new(),
+            finished_at: None,
+            error: None,
+            commit: None,
+            pushed_to: None,
+            worktree: None,
+            branch: None,
+            questions: questions.then(|| vec![Question::plain("Which?")]),
+            transcript: Vec::new(),
+            brief: None,
+            release_tag: None,
+            release_url: None,
+            release_notes: None,
+            note: None,
+            waiting_on: wait.map(|label| Wait { label: label.into(), since: String::new(), url: None }),
+        }
+    }
+
+    #[test]
+    fn a_run_dot_is_amber_only_when_the_run_wants_an_answer() {
+        let asking = run_record(RunStatus::Running, true, Some("Waiting for your answers"));
+        assert_eq!(run_dot_color(&asking), AMBER);
+        let ci = run_record(RunStatus::Running, false, Some("Waiting for the release workflow: queued"));
+        assert_eq!(run_dot_color(&ci), BLUE);
+        assert_eq!(run_dot_color(&run_record(RunStatus::Failed, false, None)), RED);
+    }
+
+    #[test]
+    fn a_project_dot_is_amber_if_any_run_wants_an_answer() {
+        let records = [
+            run_record(RunStatus::Running, false, Some("Waiting for `make test`")),
+            run_record(RunStatus::Running, true, Some("Waiting for your answers")),
+        ];
+        assert_eq!(project_dot(&records), Some((AMBER, Some("Waiting for your answers".to_string()))));
+    }
+
+    #[test]
+    fn otherwise_a_project_dot_follows_its_latest_run() {
+        let ci = "Waiting for the release workflow: in_progress";
+        let records = [run_record(RunStatus::Running, false, Some(ci)), run_record(RunStatus::Failed, false, None)];
+        assert_eq!(project_dot(&records), Some((BLUE, Some(ci.to_string()))), "a CI wait stays blue");
+
+        let records = [run_record(RunStatus::Succeeded, false, None), run_record(RunStatus::Failed, false, None)];
+        assert_eq!(project_dot(&records), Some((GREEN, None)), "no wait, no tooltip");
+
+        assert_eq!(project_dot(&[]), None);
     }
 }

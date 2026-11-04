@@ -27,6 +27,7 @@ const FEEDBACK_TAIL_LINES: usize = 150;
 const RELEASE_WORKFLOW: &str = "release.yml";
 const WORKFLOW_APPEAR_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const WORKFLOW_RUN_TIMEOUT: Duration = Duration::from_secs(90 * 60);
+const GITHUB_WAIT: &str = "Waiting for GitHub";
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Stage {
@@ -164,6 +165,21 @@ impl Question {
     }
 }
 
+/// What a running run is held up on right now, for the status line.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Wait {
+    pub label: String,
+    /// When this wait began, in the same format as `started_at`.
+    pub since: String,
+    pub url: Option<String>,
+}
+
+impl Wait {
+    fn new(label: impl Into<String>) -> Self {
+        Wait { label: label.into(), since: Local::now().to_rfc3339(), url: None }
+    }
+}
+
 /// One round of the grill: what the agent asked and what it was told.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Exchange {
@@ -198,6 +214,9 @@ pub struct RunRecord {
     /// Something a successful run still needs the user to know.
     #[serde(default)]
     pub note: Option<String>,
+    /// `None` between stages and once the run is over.
+    #[serde(default)]
+    pub waiting_on: Option<Wait>,
 }
 
 pub struct RunState {
@@ -330,6 +349,7 @@ pub fn start(project: Project, kind: RunKind, env: Env) -> RunHandle {
         release_url: None,
         release_notes: None,
         note: None,
+        waiting_on: None,
     };
     let dir = env.paths.runs_dir().join(&id);
     let _ = fs::create_dir_all(&dir);
@@ -378,6 +398,7 @@ impl Run {
             record.status = status;
             record.error = error;
             record.questions = None;
+            record.waiting_on = None;
             record.finished_at = Some(Local::now().to_rfc3339());
         });
     }
@@ -386,6 +407,17 @@ impl Run {
         change(&mut self.state.lock().unwrap().record);
         self.persist();
         (self.env.notify)();
+    }
+
+    /// Names what the run is waiting on now. A new wait restarts the timer and drops any old link.
+    fn set_wait(&self, label: impl Into<String>) {
+        self.update(|record| record.waiting_on = Some(Wait::new(label)));
+    }
+
+    /// The forge, for a call the run has to wait on.
+    fn github(&self) -> &dyn Forge {
+        self.set_wait(GITHUB_WAIT);
+        &*self.env.forge
     }
 
     fn persist(&self) {
@@ -418,6 +450,7 @@ impl Run {
             if let Some(last) = record.stages.last_mut() {
                 last.status = status;
             }
+            record.waiting_on = None;
         });
         result
     }
@@ -438,6 +471,7 @@ impl Run {
 
     fn git_stream(&self, dir: &Path, args: &[&str]) -> Result<(), Stop> {
         self.log(&format!("$ git {}", args.join(" ")));
+        self.set_wait(git_wait_label(args));
         if self.stream(git_cmd(dir, args), None, &mut |line| self.log(line))? {
             Ok(())
         } else {
@@ -448,6 +482,7 @@ impl Run {
     /// Runs a shell command in the worktree, returning whether it passed and its output tail.
     fn shell_stage(&self, line: &str, envs: &[(String, String)]) -> Result<(bool, String), Stop> {
         self.log(&format!("$ {line}"));
+        self.set_wait(format!("Waiting for `{}`", first_line(line)));
         let mut cmd = shell(line);
         cmd.current_dir(&self.worktree).envs(envs.iter().map(|(k, v)| (k, v)));
         let mut output = Vec::new();
@@ -477,6 +512,7 @@ impl Run {
             return Err(Stop::Failed("This repo has no `origin` remote to push to".into()));
         }
         if full {
+            self.set_wait("Waiting for the GitHub CLI check");
             self.env.forge.ready(repo).map_err(|e| format!("GitHub CLI isn't ready: {e}"))?;
         }
         let default = &self.project.default_branch;
@@ -524,6 +560,7 @@ impl Run {
     }
 
     fn make_has_test_target(&self) -> Result<bool, Stop> {
+        self.set_wait("Waiting for `make -n test`");
         let mut cmd = command("make");
         cmd.current_dir(&self.worktree).args(["-n", "test"]);
         self.stream(cmd, None, &mut |_| {})
@@ -546,6 +583,8 @@ impl Run {
     }
 
     fn call_agent(&self, role: Role, prompt: String, resume: Option<String>) -> Result<AgentResult, Stop> {
+        let attempt = self.state.lock().unwrap().record.stages.last().map_or(1, |stage| stage.attempt);
+        self.set_wait(agent_wait_label(&role, attempt, self.project.max_attempts.max(1)));
         let mut env = self.build_env();
         env.extend(push_guard_env(origin_url(&self.project.path).as_deref()));
         let request = AgentRequest {
@@ -586,7 +625,10 @@ impl Run {
             }
 
             let questions = turn.questions;
-            self.update(|record| record.questions = Some(questions.clone()));
+            self.update(|record| {
+                record.questions = Some(questions.clone());
+                record.waiting_on = Some(Wait::new("Waiting for your answers"));
+            });
             let reply = self.wait_for_reply()?;
             let answer = match reply {
                 GrillReply::Answer(answer) => {
@@ -605,6 +647,7 @@ impl Run {
             let questions: Vec<String> = questions.into_iter().map(|question| question.text).collect();
             self.update(|record| {
                 record.questions = None;
+                record.waiting_on = None;
                 record.transcript.push(Exchange { questions, answer });
             });
         }
@@ -706,7 +749,9 @@ impl Run {
             self.log(file);
         }
         let message = commit_message(title, summary, &self.id);
-        let cmd = git_cmd(wt, &["commit", "--file", "-"]);
+        let args = ["commit", "--file", "-"];
+        self.set_wait(git_wait_label(&args));
+        let cmd = git_cmd(wt, &args);
         if !self.stream(cmd, Some(message), &mut |line| self.log(line))? {
             return Err(Stop::Failed("git commit failed".into()));
         }
@@ -853,7 +898,6 @@ impl Run {
 
     fn cut_release(&self, bump: Bump) -> Result<String, Stop> {
         let wt = &self.worktree;
-        let forge = &self.env.forge;
         let previous = latest_tag(wt);
         let manifest = version::read_manifest(wt);
         let current = manifest
@@ -866,7 +910,7 @@ impl Run {
         self.log(&format!("Releasing {tag}"));
         self.update(|record| record.release_tag = Some(tag.clone()));
         if git(wt, &["rev-parse", "-q", "--verify", &format!("refs/tags/{tag}")]).is_ok()
-            || forge.release(wt, &tag)?.is_some()
+            || self.github().release(wt, &tag)?.is_some()
         {
             return Err(Stop::Failed(format!("{tag} already exists")));
         }
@@ -881,7 +925,9 @@ impl Run {
             self.write_version(*kind, &version)?;
             self.git_stream(wt, &["add", "--all"])?;
             let message = format!("Release {version}\n\nFactory-Run: {}\n", self.id);
-            let cmd = git_cmd(wt, &["commit", "--file", "-"]);
+            let args = ["commit", "--file", "-"];
+            self.set_wait(git_wait_label(&args));
+            let cmd = git_cmd(wt, &args);
             if !self.stream(cmd, Some(message), &mut |line| self.log(line))? {
                 return Err(Stop::Failed("Could not commit the version bump".into()));
             }
@@ -894,15 +940,15 @@ impl Run {
             // These projects build on CI: a push to `release` produces the draft.
             self.git_stream(wt, &["push", "--atomic", "origin", &main, "HEAD:refs/heads/release"])?;
             self.wait_for_workflow(&sha)?;
-            let draft = forge.release(wt, &tag)?;
+            let draft = self.github().release(wt, &tag)?;
             if !draft.is_some_and(|release| release.is_draft) {
                 return Err(Stop::Failed(format!("The release workflow passed but left no draft for {tag}")));
             }
-            forge.set_notes(wt, &tag, &notes)?;
+            self.github().set_notes(wt, &tag, &notes)?;
         } else {
             self.git_stream(wt, &["push", "origin", &main])?;
             let title = format!("{} {tag}", self.project.name);
-            forge.create_draft(wt, &tag, &title, &sha, &notes)?;
+            self.github().create_draft(wt, &tag, &title, &sha, &notes)?;
             let command = self.project.release_command.trim();
             if !command.is_empty() {
                 let env = [("FACTORY_TAG".to_string(), tag.clone())];
@@ -965,6 +1011,10 @@ impl Run {
     fn wait_for_workflow(&self, sha: &str) -> Result<(), Stop> {
         let started = Instant::now();
         let mut last_status = String::new();
+        // One wait from start to finish, so the timer carries on as the workflow's status changes.
+        let first = Wait::new("Waiting for the release workflow to start");
+        let since = first.since.clone();
+        self.update(|record| record.waiting_on = Some(first));
         loop {
             match self.env.forge.workflow_run(&self.worktree, RELEASE_WORKFLOW, sha)? {
                 None if started.elapsed() > WORKFLOW_APPEAR_TIMEOUT => {
@@ -975,6 +1025,13 @@ impl Run {
                     if run.status != last_status {
                         self.log(&format!("Release workflow: {} {}", run.status, run.url));
                         last_status = run.status.clone();
+                        self.update(|record| {
+                            record.waiting_on = Some(Wait {
+                                label: format!("Waiting for the release workflow: {}", run.status),
+                                since: since.clone(),
+                                url: Some(run.url.clone()),
+                            });
+                        });
                     }
                     if run.status == "completed" {
                         if run.conclusion == "success" {
@@ -1002,10 +1059,9 @@ impl Run {
 
     fn publish(&self, tag: &str) -> Result<(), Stop> {
         let wt = &self.worktree;
-        let forge = &self.env.forge;
         let still_draft = format!("{tag} is still a draft on GitHub and can be published by hand");
-        forge.publish(wt, tag).map_err(|e| format!("{still_draft}: {e}"))?;
-        let release = forge.release(wt, tag)?.ok_or_else(|| format!("{tag} disappeared after publishing"))?;
+        self.github().publish(wt, tag).map_err(|e| format!("{still_draft}: {e}"))?;
+        let release = self.github().release(wt, tag)?.ok_or_else(|| format!("{tag} disappeared after publishing"))?;
         if release.is_draft {
             return Err(Stop::Failed(still_draft));
         }
@@ -1024,6 +1080,29 @@ impl Run {
             Err(error) => self.log(&format!("WARNING: could not clean up worktree: {error}")),
         }
     }
+}
+
+/// Only the subcommand: the full arguments are noise here, and they're in the log anyway.
+fn git_wait_label(args: &[&str]) -> String {
+    format!("Waiting for `git {}`", args.first().copied().unwrap_or_default())
+}
+
+fn first_line(text: &str) -> &str {
+    text.trim().lines().next().unwrap_or_default()
+}
+
+fn agent_wait_label(role: &Role, attempt: u32, max_attempts: u32) -> String {
+    let (agent, retried) = match role {
+        Role::Grill => ("grill", false),
+        Role::Build => ("build", true),
+        Role::Makefile => ("Makefile", true),
+        Role::Summarize => ("release notes", false),
+    };
+    let mut label = format!("Waiting for the {agent} agent");
+    if retried && max_attempts > 1 {
+        label.push_str(&format!(" (attempt {attempt} of {max_attempts})"));
+    }
+    label
 }
 
 fn parse_grill_turn(result: &AgentResult) -> GrillTurn {
@@ -1139,6 +1218,7 @@ pub fn load_records(paths: &Paths) -> Vec<RunRecord> {
         if record.status == RunStatus::Running {
             record.status = RunStatus::Interrupted;
             record.questions = None;
+            record.waiting_on = None;
             let _ = save(paths, record);
         }
     }
@@ -1237,6 +1317,8 @@ mod tests {
         polls: Mutex<usize>,
         workflow_conclusion: Option<String>,
         workflow_draft: Option<String>,
+        /// What the workflow reports between appearing and completing. Empty means `in_progress`.
+        workflow_statuses: Vec<&'static str>,
         publish_fails: bool,
     }
 
@@ -1254,9 +1336,10 @@ mod tests {
                 conclusion: conclusion.into(),
                 url: "https://example.test/run".into(),
             };
+            let statuses: &[&str] = if self.workflow_statuses.is_empty() { &["in_progress"] } else { &self.workflow_statuses };
             Ok(match *polls {
                 1 => None,
-                2 => Some(run("in_progress", "")),
+                poll if poll - 2 < statuses.len() => Some(run(statuses[poll - 2], "")),
                 _ => {
                     let conclusion = self.workflow_conclusion.clone().unwrap_or("success".to_string());
                     if conclusion == "success" {
@@ -2251,5 +2334,253 @@ mod tests {
         assert_eq!(loaded[0].questions, None);
         assert_eq!(loaded[1].status, RunStatus::Succeeded);
         assert!(read_log(&fx.paths, &record.id).iter().any(|line| line.contains("Commit #1")));
+    }
+
+    /// An env that records every value `waiting_on` takes, in order. It reads them from `run.json`
+    /// each time the run notifies, on the run's own thread, so none can be missed.
+    fn recording_env(fx: &Fixture, agent: FakeAgent, forge: FakeForge) -> (Env, Arc<Mutex<Vec<Option<Wait>>>>) {
+        let seen: Arc<Mutex<Vec<Option<Wait>>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut env = env_for(fx, Arc::new(agent), Arc::new(forge));
+        let (recorder, runs_dir) = (seen.clone(), fx.paths.runs_dir());
+        env.notify = Arc::new(move || {
+            for entry in fs::read_dir(&runs_dir).unwrap().flatten() {
+                let Ok(text) = fs::read_to_string(entry.path().join("run.json")) else { continue };
+                let wait = serde_json::from_str::<RunRecord>(&text).unwrap().waiting_on;
+                let mut seen = recorder.lock().unwrap();
+                if seen.last() != Some(&wait) {
+                    seen.push(wait);
+                }
+            }
+        });
+        (env, seen)
+    }
+
+    fn run_recording_waits(fx: &Fixture, kind: RunKind, agent: FakeAgent, forge: FakeForge) -> (RunRecord, Vec<Option<Wait>>) {
+        let (env, seen) = recording_env(fx, agent, forge);
+        let handle = start(fx.project.clone(), kind, env);
+        handle.thread.join().unwrap();
+        let record = handle.state.lock().unwrap().record.clone();
+        let seen = seen.lock().unwrap().clone();
+        (record, seen)
+    }
+
+    /// The labels in order, without the gaps between stages or repeats of the same label.
+    fn wait_labels(waits: &[Option<Wait>]) -> Vec<String> {
+        let mut labels: Vec<String> = waits.iter().flatten().map(|wait| wait.label.clone()).collect();
+        labels.dedup();
+        labels
+    }
+
+    fn wait_labelled<'a>(waits: &'a [Option<Wait>], label: &str) -> &'a Wait {
+        waits.iter().flatten().find(|wait| wait.label == label).unwrap_or_else(|| panic!("never waited on: {label}"))
+    }
+
+    #[test]
+    fn every_step_of_a_run_names_what_it_waits_on() {
+        let fx = ci_project();
+        let forge = FakeForge { workflow_draft: Some("v0.3.2".into()), ..Default::default() };
+        let (record, waits) = run_recording_waits(&fx, build("Fix"), FakeAgent::new(Box::new(write_fixed)), forge);
+
+        assert_eq!(record.status, RunStatus::Succeeded, "{:?}", record.error);
+        assert_eq!(
+            wait_labels(&waits),
+            [
+                "Waiting for the GitHub CLI check",
+                "Waiting for `git fetch`",
+                "Waiting for `git worktree`",
+                "Waiting for `make -n test`",
+                "Waiting for the grill agent",
+                "Waiting for `git switch`",
+                "Waiting for the build agent (attempt 1 of 3)",
+                "Waiting for `make test`",
+                "Waiting for `git add`",
+                "Waiting for `git commit`",
+                "Waiting for `git fetch`",
+                "Waiting for `git push`",
+                "Waiting for GitHub",
+                "Waiting for the release notes agent",
+                "Waiting for `cargo update --workspace --offline`",
+                "Waiting for `git add`",
+                "Waiting for `git commit`",
+                "Waiting for `git push`",
+                "Waiting for the release workflow to start",
+                "Waiting for the release workflow: in_progress",
+                "Waiting for the release workflow: completed",
+                "Waiting for GitHub",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_new_wait_restarts_the_timer_and_a_finished_stage_clears_the_wait() {
+        let fx = fixture();
+        let (record, waits) = run_recording_waits(&fx, build("Fix"), FakeAgent::new(Box::new(write_fixed)), FakeForge::default());
+        assert_eq!(record.status, RunStatus::Succeeded, "{:?}", record.error);
+
+        let fetch = wait_labelled(&waits, "Waiting for `git fetch`");
+        let worktree = wait_labelled(&waits, "Waiting for `git worktree`");
+        assert_ne!(fetch.since, worktree.since);
+
+        // Prepare's last step is followed by a gap, not by the Grill's first wait.
+        let last_in_prepare = waits.iter().position(|wait| wait.as_ref().is_some_and(|w| w.label == "Waiting for `make -n test`")).unwrap();
+        assert_eq!(waits[last_in_prepare + 1], None);
+    }
+
+    #[test]
+    fn only_a_multi_line_commands_first_line_is_named() {
+        let mut fx = fixture();
+        fx.project.setup_command = "git --version\ngit --help".into();
+        let (_, waits) = run_recording_waits(&fx, build("Fix"), FakeAgent::new(Box::new(write_fixed)), FakeForge::default());
+        wait_labelled(&waits, "Waiting for `git --version`");
+    }
+
+    #[test]
+    fn agent_labels_only_show_the_attempt_for_roles_that_retry() {
+        assert_eq!(agent_wait_label(&Role::Grill, 1, 3), "Waiting for the grill agent");
+        assert_eq!(agent_wait_label(&Role::Summarize, 1, 3), "Waiting for the release notes agent");
+        assert_eq!(agent_wait_label(&Role::Build, 2, 3), "Waiting for the build agent (attempt 2 of 3)");
+        assert_eq!(agent_wait_label(&Role::Makefile, 1, 2), "Waiting for the Makefile agent (attempt 1 of 2)");
+        assert_eq!(agent_wait_label(&Role::Build, 1, 1), "Waiting for the build agent");
+        assert_eq!(agent_wait_label(&Role::Makefile, 1, 1), "Waiting for the Makefile agent");
+    }
+
+    #[test]
+    fn a_retried_build_shows_its_attempt_in_the_wait() {
+        let fx = fixture();
+        let script: Script = Box::new(|request, attempt| {
+            let file = if attempt == 1 { "wrong.txt" } else { "fixed.txt" };
+            fs::write(request.dir.join(file), "x\n").map_err(|e| e.to_string())
+        });
+        let (record, waits) = run_recording_waits(&fx, build("Fix"), FakeAgent::new(script), FakeForge::default());
+        assert_eq!(record.status, RunStatus::Succeeded, "{:?}", record.error);
+        wait_labelled(&waits, "Waiting for the build agent (attempt 1 of 3)");
+        wait_labelled(&waits, "Waiting for the build agent (attempt 2 of 3)");
+    }
+
+    #[test]
+    fn a_single_attempt_build_doesnt_mention_attempts() {
+        let mut fx = fixture();
+        fx.project.max_attempts = 1;
+        let (_, waits) = run_recording_waits(&fx, build("Fix"), FakeAgent::new(Box::new(write_fixed)), FakeForge::default());
+        wait_labelled(&waits, "Waiting for the build agent");
+    }
+
+    #[test]
+    fn pending_questions_wait_on_the_user_until_the_reply() {
+        let fx = fixture();
+        let mut agent = FakeAgent::new(Box::new(write_fixed));
+        agent.grill = Box::new(|turn| match turn {
+            1 => json!({"status": "questions", "questions": ["Which?"]}),
+            _ => ready(),
+        });
+        let (env, seen) = recording_env(&fx, agent, FakeForge::default());
+        let handle = start(fx.project.clone(), build("Fix"), env);
+
+        // Set in one update, so there's no moment with questions and some other wait.
+        wait_until(&handle.state, "questions", |s| s.record.questions.is_some());
+        {
+            let state = handle.state.lock().unwrap();
+            assert_eq!(state.record.waiting_on.as_ref().unwrap().label, "Waiting for your answers");
+        }
+        handle.replies.send(GrillReply::Answer("That one".into())).unwrap();
+        wait_until(&handle.state, "the reply to land", |s| !s.record.transcript.is_empty());
+        {
+            let state = handle.state.lock().unwrap();
+            assert_eq!(state.record.questions, None);
+            let label = state.record.waiting_on.as_ref().map(|wait| wait.label.as_str());
+            assert_ne!(label, Some("Waiting for your answers"));
+        }
+        handle.thread.join().unwrap();
+        assert_eq!(handle.state.lock().unwrap().record.status, RunStatus::Succeeded);
+
+        let labels = wait_labels(&seen.lock().unwrap());
+        let answers = labels.iter().position(|label| label == "Waiting for your answers").unwrap();
+        assert_eq!(labels[answers + 1], "Waiting for the grill agent");
+    }
+
+    #[test]
+    fn the_release_workflow_is_one_wait_with_a_link_to_the_run() {
+        let fx = ci_project();
+        let forge = FakeForge {
+            workflow_draft: Some("v0.3.2".into()),
+            workflow_statuses: vec!["queued", "queued", "in_progress"],
+            ..Default::default()
+        };
+        let (record, waits) = run_recording_waits(&fx, build("Fix"), FakeAgent::new(Box::new(write_fixed)), forge);
+        assert_eq!(record.status, RunStatus::Succeeded, "{:?}", record.error);
+
+        let starting = wait_labelled(&waits, "Waiting for the release workflow to start");
+        let queued = wait_labelled(&waits, "Waiting for the release workflow: queued");
+        let in_progress = wait_labelled(&waits, "Waiting for the release workflow: in_progress");
+        assert_eq!(starting.url, None);
+        assert_eq!(queued.url.as_deref(), Some("https://example.test/run"));
+        assert_eq!(in_progress.url.as_deref(), Some("https://example.test/run"));
+        assert_eq!(starting.since, queued.since, "the status changing doesn't restart the timer");
+        assert_eq!(queued.since, in_progress.since, "the status changing doesn't restart the timer");
+
+        // What comes next is a new wait: the link goes and the timer restarts.
+        let last = waits.iter().rposition(|wait| wait.as_ref().is_some_and(|w| w.url.is_some())).unwrap();
+        let next = waits[last + 1].as_ref().unwrap();
+        assert_eq!(next.label, "Waiting for GitHub");
+        assert_eq!(next.url, None);
+        assert_ne!(next.since, in_progress.since);
+    }
+
+    #[test]
+    fn a_run_that_succeeded_or_failed_is_not_waiting_on_anything() {
+        let (succeeded, _, _) = run(&fixture(), Box::new(write_fixed));
+        assert_eq!(succeeded.status, RunStatus::Succeeded, "{:?}", succeeded.error);
+        assert_eq!(succeeded.waiting_on, None);
+
+        let (failed, _, _) = run(&fixture(), Box::new(|_, _| Ok(())));
+        assert_eq!(failed.status, RunStatus::Failed);
+        assert_eq!(failed.waiting_on, None);
+    }
+
+    #[test]
+    fn a_cancelled_run_is_not_waiting_on_anything() {
+        let fx = fixture();
+        let mut agent = FakeAgent::new(Box::new(write_fixed));
+        agent.grill = Box::new(|_| json!({"status": "questions", "questions": ["Which?"]}));
+        let handle = start(fx.project.clone(), build("Fix"), env_for(&fx, Arc::new(agent), Arc::new(FakeForge::default())));
+        wait_until(&handle.state, "the wait", |s| s.record.waiting_on.as_ref().is_some_and(|w| w.label.contains("your answers")));
+        handle.cancel.cancel();
+        handle.thread.join().unwrap();
+
+        let state = handle.state.lock().unwrap();
+        assert_eq!(state.record.status, RunStatus::Cancelled);
+        assert_eq!(state.record.waiting_on, None);
+    }
+
+    #[test]
+    fn a_saved_run_without_a_wait_still_loads() {
+        let fx = fixture();
+        let (record, _, _) = run(&fx, Box::new(write_fixed));
+        let mut old = serde_json::to_value(&record).unwrap();
+        old.as_object_mut().unwrap().remove("waiting_on");
+        let dir = fx.paths.runs_dir().join(&record.id);
+        fs::write(dir.join("run.json"), old.to_string()).unwrap();
+
+        let loaded = load_records(&fx.paths);
+        assert_eq!(loaded.len(), 1, "the old record isn't dropped");
+        assert_eq!(loaded[0].waiting_on, None);
+    }
+
+    #[test]
+    fn an_interrupted_run_is_not_waiting_on_anything() {
+        let fx = fixture();
+        let (record, _, _) = run(&fx, Box::new(write_fixed));
+        let mut stale = record.clone();
+        stale.id = "99999999-000000-0000".into();
+        stale.status = RunStatus::Running;
+        stale.waiting_on = Some(Wait::new("Waiting for `make test`"));
+        save(&fx.paths, &stale).unwrap();
+
+        let loaded = load_records(&fx.paths);
+        assert_eq!(loaded[0].id, stale.id);
+        assert_eq!(loaded[0].status, RunStatus::Interrupted);
+        assert_eq!(loaded[0].waiting_on, None);
+        let saved = fs::read_to_string(fx.paths.runs_dir().join(&stale.id).join("run.json")).unwrap();
+        assert_eq!(serde_json::from_str::<RunRecord>(&saved).unwrap().waiting_on, None, "cleared on disk too");
     }
 }
