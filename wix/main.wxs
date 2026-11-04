@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   A per-user MSI: no UAC prompt, so the app can update itself in one click.
-  Built by .github/workflows/release.yml, which passes in Version and ExePath.
+  Built by .github/workflows/release.yml, which passes in Version, ExePath and IconPath.
   Uninstalling only removes what's listed here, so %APPDATA%\factory and %LOCALAPPDATA%\factory stay.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
@@ -15,6 +15,10 @@
 
     <MajorUpgrade DowngradeErrorMessage="A newer version of Factory is already installed." />
     <MediaTemplate EmbedCab="yes" />
+
+    <!-- Shown in Installed apps. The Start Menu shortcut uses the icon embedded in the exe. -->
+    <Icon Id="factory.ico" SourceFile="$(var.IconPath)" />
+    <Property Id="ARPPRODUCTICON" Value="factory.ico" />
 
     <StandardDirectory Id="LocalAppDataFolder">
       <Directory Id="ProgramsFolder" Name="Programs">

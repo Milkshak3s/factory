@@ -48,6 +48,9 @@ The version comes from `Cargo.toml` or `package.json`, otherwise from the latest
 Factory's own releases take the first route: its `.github/workflows/release.yml` builds
 `factory-<version>-x64.msi` with WiX on `windows-latest` and attaches it to the draft.
 
+The app icon is drawn in code in `src/icon.rs`. The window renders it at startup, and `build.rs`
+embeds it in the exe and writes `factory.ico` beside the exe for the MSI.
+
 ## What keeps agents out of the pipeline's steps
 
 - `git commit`, `push`, `tag` and similar are on the build agent's tool denylist.

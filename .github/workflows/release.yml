@@ -55,7 +55,7 @@ jobs:
         run: |
           $version = $env:VERSION
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          wix build wix/main.wxs -arch x64 -d "Version=$version" -d "ExePath=target\release\factory.exe" -o "dist\factory-$version-x64.msi"
+          wix build wix/main.wxs -arch x64 -d "Version=$version" -d "ExePath=target\release\factory.exe" -d "IconPath=target\release\factory.ico" -o "dist\factory-$version-x64.msi"
 
       - name: Create the draft release
         env:
