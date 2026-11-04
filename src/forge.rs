@@ -8,6 +8,7 @@ use std::thread;
 use serde::Deserialize;
 
 use crate::proc::command;
+use crate::wsl;
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct WorkflowRun {
@@ -58,9 +59,9 @@ fn gh_names(windows: bool) -> &'static [&'static str] {
 
 impl GhCli {
     fn cmd(&self, dir: &Path, args: &[&str]) -> Command {
-        let mut cmd = command(&self.program);
+        let mut cmd = command(wsl::program(dir, "gh", &self.program));
         cmd.current_dir(dir).args(args).env("GH_PROMPT_DISABLED", "1");
-        cmd
+        wsl::route(cmd)
     }
 
     pub(crate) fn run(&self, dir: &Path, args: &[&str], input: Option<&str>) -> Result<String, String> {
@@ -79,8 +80,8 @@ impl GhCli {
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).trim_end().to_string())
         } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(format!("gh {}: {}", args.join(" "), stderr.trim()))
+            let detail = wsl::failure_detail(wsl::target(dir).is_some(), &output.stdout, &output.stderr);
+            Err(format!("gh {}: {detail}", args.join(" ")))
         }
     }
 }
@@ -127,6 +128,20 @@ fn parse_runs(text: &str) -> Result<Option<WorkflowRun>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inside_a_distro_gh_is_found_by_name_never_at_its_windows_path() {
+        wsl::seed_env("GhDistro", "/seeded/bin", "/home/jo");
+        let gh = GhCli { program: PathBuf::from(r"C:\Program Files\GitHub CLI\gh.exe") };
+        let cmd = gh.cmd(Path::new(r"\\wsl$\GhDistro\home\jo\repo"), &["auth", "status"]);
+        assert_eq!(cmd.get_program(), "wsl.exe");
+        let args: Vec<_> = cmd.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        assert!(args.contains(&"GH_PROMPT_DISABLED=1".to_string()));
+        assert_eq!(args[args.len() - 3..], ["gh", "auth", "status"]);
+
+        let native = gh.cmd(Path::new("."), &["auth", "status"]);
+        assert_eq!(native.get_program(), gh.program.as_os_str());
+    }
 
     #[test]
     fn only_windows_looks_for_an_exe() {

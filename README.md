@@ -112,6 +112,40 @@ looks in `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`, `~/.cargo/bin` a
 so it finds the same `claude`, `gh`, `git` and `make` your terminal does. Launched from a terminal,
 it uses that terminal's `PATH` plus those directories.
 
+## WSL projects
+
+The Windows app can also work on repos on a WSL distro's Linux filesystem. Every tool for those
+projects, including setup and release commands, runs inside the distro through `wsl.exe`.
+
+**Adding one:** use *Add…* and pick the repo, or a folder of repos, under `\\wsl.localhost\<distro>\`
+(*Linux* in Explorer's sidebar). Paths under `\\wsl$\` work too. The project shows a `WSL: <distro>`
+label. Repos on a Windows drive (`/mnt/c/...`) aren't supported, even from inside a distro.
+
+**What each distro needs:**
+
+- `git`, `make`, `claude` and `gh` on your login shell's `PATH`, with `claude` and `gh` logged in
+  there. Their Windows copies aren't used, and `claude_path` doesn't apply. A Windows copy reached
+  through `/mnt/...` doesn't count.
+- Git auth that works without prompting, such as `gh auth setup-git` or an SSH key with no passphrase
+  prompt. Factory doesn't forward an SSH agent or Windows credentials.
+- `setsid --wait` from util-linux, so that *Stop* can kill what a run started in the distro. Mainstream
+  distros have it. On a BusyBox-based distro such as Alpine, you may need to install `util-linux`.
+
+Factory checks for the tools, and for the `gh` login, on each refresh and again at the start of each
+run. Anything missing shows as an amber message naming the distro, and *Run pipeline* stays disabled
+until it's fixed. A logged-out `claude` isn't checked in advance, so it fails the run at its first
+agent. Factory reads the `PATH` from your interactive login shell, once per distro, and reads it again
+at the start of each run and on *Refresh*, so a newly installed tool is picked up without a restart.
+
+**Where things live:** worktrees are in `~/.local/share/factory/worktrees/<project>/<run>` and the
+Cargo cache is in `~/.local/share/factory/target/<project>`, under the distro's default user. Run
+history and logs stay in the Windows data folder. *Open worktree* opens the run's worktree in
+Explorer.
+
+**Stopped distros:** the 30-second refresh, startup and a finished run never start a stopped distro,
+so Factory being open doesn't keep its VM's memory in use. The project shows `<distro> is stopped`
+with its last known status. Clicking *Refresh* or *Add…*, or starting a run, wakes it.
+
 ## Updates
 
 The installed app checks this repo's latest published release at startup and every 30 minutes, or
@@ -175,7 +209,8 @@ cargo run --release
 ```
 
 Use *Add…* to pick a repo, or a folder of repos. Each project needs an `origin` remote and a
-Makefile with a `test` target.
+Makefile with a `test` target. If all your projects are in WSL, the Windows `claude` and `gh` aren't
+needed for them, though the updater still uses `gh`. See [WSL projects](#wsl-projects).
 
 If the Makefile is missing, *Create Makefile* has an agent write one from the project's tests and CI.
 That agent can write files but can't run commands. The factory runs `make test`, sends failures back
@@ -192,6 +227,9 @@ a data folder:
 | macOS | `~/Library/Application Support/factory/config.toml` | `~/Library/Application Support/factory` |
 | Linux | `~/.config/factory/config.toml` | `~/.local/share/factory` |
 
+A WSL project's worktrees and Cargo cache are in `~/.local/share/factory` inside its distro. Its run
+history stays in the Windows data folder.
+
 ## Tests
 
 ```bash
@@ -204,4 +242,12 @@ GitHub is still faked):
 
 ```bash
 cargo test -- --ignored
+```
+
+The WSL tests run against a real distro only if you name one, on Windows, and do nothing otherwise.
+`make test` doesn't cover the real distro path, so run these after changing how commands reach WSL.
+They create and remove temp directories in that distro:
+
+```bash
+FACTORY_TEST_WSL_DISTRO=Ubuntu cargo test wsl::tests::real -- --ignored
 ```

@@ -4,11 +4,12 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use crate::proc::command;
+use crate::wsl;
 
 pub fn git_cmd(dir: &Path, args: &[&str]) -> Command {
     let mut cmd = command("git");
     cmd.current_dir(dir).args(args).env("GIT_TERMINAL_PROMPT", "0");
-    cmd
+    wsl::route(cmd)
 }
 
 pub fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
@@ -19,8 +20,8 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim_end().to_string())
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("git {}: {}", args.join(" "), stderr.trim()))
+        let detail = wsl::failure_detail(wsl::target(dir).is_some(), &output.stdout, &output.stderr);
+        Err(format!("git {}: {detail}", args.join(" ")))
     }
 }
 
@@ -101,6 +102,21 @@ fn parse_porcelain(text: &str) -> RepoStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_goes_through_wsl_only_for_a_wsl_directory() {
+        wsl::seed_env("GitDistro", "/seeded/bin", "/home/jo");
+        let cmd = git_cmd(Path::new(r"\\wsl.localhost\GitDistro\home\jo\repo"), &["status"]);
+        assert_eq!(cmd.get_program(), "wsl.exe");
+        let args: Vec<_> = cmd.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        assert_eq!(args[..4], ["-d", "GitDistro", "--cd", "/home/jo/repo"]);
+        assert!(args.contains(&"GIT_TERMINAL_PROMPT=0".to_string()));
+        assert_eq!(args[args.len() - 2..], ["git", "status"]);
+
+        let native = git_cmd(Path::new("."), &["status"]);
+        assert_eq!(native.get_program(), "git");
+        assert_eq!(native.get_current_dir(), Some(Path::new(".")));
+    }
 
     #[test]
     fn parses_branch_counts_and_dirty_files() {

@@ -12,6 +12,7 @@ mod pipeline;
 mod proc;
 mod update;
 mod version;
+mod wsl;
 
 /// Large enough for the taskbar on a high-DPI display.
 const WINDOW_ICON_SIZE: u32 = 128;

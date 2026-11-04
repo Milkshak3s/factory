@@ -1,10 +1,12 @@
 //! The agent stages: headless Claude Code, restricted to what each stage needs.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use serde_json::Value;
 
 use crate::proc::{Cancel, Exit, command, run_streaming};
+use crate::wsl;
 
 /// Told to the agent up front. The pipeline verifies what it can rather than trusting this.
 const RULES: &str = "You are the build step of a software factory. Implement the solution or task you are given by \
@@ -50,7 +52,12 @@ a `test` target that prints that and exits non-zero, and return has_tests false;
 has_tests true. The factory runs `make test` after you stop, and commits and pushes the result. You \
 can't run commands yourself.";
 
-/// The Makefile agent's rules, describing the shell that recipes run under on this host.
+/// Whether recipes for a project in `dir` run on Windows. A WSL project's run inside the distro.
+fn recipes_run_on_windows(host_windows: bool, dir: &Path) -> bool {
+    host_windows && wsl::target(dir).is_none()
+}
+
+/// The Makefile agent's rules, describing the shell that recipes will run under.
 fn makefile_rules(windows: bool) -> String {
     let shell = if windows { MAKEFILE_SHELL_WINDOWS } else { MAKEFILE_SHELL_POSIX };
     format!("{MAKEFILE_RULES_START} {shell} {MAKEFILE_RULES_END}")
@@ -144,7 +151,7 @@ impl ClaudeCli {
                 "--tools",
                 "Read,Grep,Glob,Write,Edit",
                 "--append-system-prompt",
-                makefile_rules(cfg!(windows)).as_str(),
+                makefile_rules(recipes_run_on_windows(cfg!(windows), request.dir)).as_str(),
                 "--json-schema",
                 MAKEFILE_SCHEMA,
             ]),
@@ -160,6 +167,20 @@ impl ClaudeCli {
     }
 }
 
+impl ClaudeCli {
+    /// In a distro `claude` comes from the distro's PATH: `claude_path` is a Windows path.
+    pub(crate) fn command(&self, request: &AgentRequest) -> Command {
+        let mut cmd = command(wsl::program(request.dir, "claude", &self.program));
+        cmd.current_dir(request.dir)
+            .args(Self::args(request))
+            .envs(request.env.iter().map(|(k, v)| (k, v)))
+            // Set when the factory itself was launched from a Claude Code session. wsl.exe doesn't
+            // forward the Windows environment, so inside a distro there's nothing to remove.
+            .env_remove("CLAUDECODE");
+        wsl::route(cmd)
+    }
+}
+
 impl Agent for ClaudeCli {
     /// Returns `Ok(None)` if cancelled.
     fn run(
@@ -168,12 +189,7 @@ impl Agent for ClaudeCli {
         cancel: &Cancel,
         log: &mut dyn FnMut(&str),
     ) -> Result<Option<AgentResult>, String> {
-        let mut cmd = command(&self.program);
-        cmd.current_dir(request.dir)
-            .args(Self::args(&request))
-            .envs(request.env.iter().map(|(k, v)| (k, v)))
-            // Set when the factory itself was launched from a Claude Code session.
-            .env_remove("CLAUDECODE");
+        let cmd = self.command(&request);
 
         let mut result = AgentResult::default();
         let mut failure = None;
@@ -377,6 +393,40 @@ mod tests {
         assert!(unix.contains("listing them. Recipes run under a POSIX sh. If the project has no tests"));
         assert!(!unix.contains("cmd.exe"));
         assert!(!unix.contains("Windows"));
+    }
+
+    #[test]
+    fn the_makefile_shell_follows_the_project_directory_not_just_the_host() {
+        let unc = Path::new(r"\\wsl.localhost\Ubuntu\home\jo\repo");
+        assert!(!recipes_run_on_windows(true, unc));
+        assert!(recipes_run_on_windows(true, Path::new(r"C:\repo")));
+        assert!(!recipes_run_on_windows(false, Path::new("/home/jo/repo")));
+
+        let args = ClaudeCli::args(&request(unc, Role::Makefile));
+        let rules = args.iter().position(|a| a == "--append-system-prompt").unwrap();
+        assert!(args[rules + 1].contains("Recipes run under a POSIX sh"));
+        assert!(!args[rules + 1].contains("cmd.exe"));
+    }
+
+    #[test]
+    fn inside_a_distro_claude_runs_by_name_with_its_arguments_whole() {
+        wsl::seed_env("AgentDistro", "/seeded/bin", "/home/jo");
+        let claude = ClaudeCli { program: PathBuf::from(r"C:\Tools\claude.exe") };
+        let dir = Path::new(r"\\wsl.localhost\AgentDistro\home\jo\wt");
+        let cmd = claude.command(&request(dir, Role::Summarize));
+        assert_eq!(cmd.get_program(), "wsl.exe");
+        let args: Vec<_> = cmd.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        assert!(args.contains(&"claude".to_string()));
+        assert!(!args.iter().any(|arg| arg.contains("claude.exe")));
+        assert!(args.windows(2).any(|w| w == ["--tools", ""]), "the empty value survives");
+
+        let cmd = claude.command(&request(dir, Role::Grill));
+        let args: Vec<_> = cmd.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        assert!(args.iter().any(|arg| arg == GRILL_SCHEMA), "the JSON arrives as one argument");
+        assert!(args.iter().any(|arg| arg == GRILL_RULES), "and so does the system prompt");
+
+        let native = claude.command(&request(Path::new("."), Role::Build));
+        assert_eq!(native.get_program(), claude.program.as_os_str());
     }
 
     #[test]

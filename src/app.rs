@@ -18,6 +18,7 @@ use crate::pipeline::{self, Env, GrillReply, Question, RunKind, RunRecord, RunSt
 use crate::proc::{Cancel, command};
 use crate::update::{self, Step, Updater};
 use crate::version::Bump;
+use crate::wsl::{self, DistroState, ToolCheck};
 
 const REFRESH_EVERY: Duration = Duration::from_secs(30);
 const EXIT_GRACE: Duration = Duration::from_secs(5);
@@ -101,6 +102,125 @@ fn enough_reply(reply: Option<String>) -> GrillReply {
     }
 }
 
+/// Results from threads doing WSL work, which can take a distro's whole boot time.
+enum WslEvent {
+    State(String, DistroState),
+    Tools(String, Result<ToolCheck, String>),
+    /// What *Add…* found in a picked folder.
+    Added(PathBuf, Vec<Project>),
+    Notice(String),
+}
+
+/// What a project's blockers depend on besides the repo.
+enum Tooling<'a> {
+    Native {
+        claude_found: bool,
+        gh_status: Option<&'a Result<(), String>>,
+    },
+    Wsl {
+        distro: &'a str,
+        on_windows_drive: bool,
+        state: Option<&'a DistroState>,
+        tools: Option<&'a Result<ToolCheck, String>>,
+    },
+}
+
+/// Whether what's known about a repo can be relied on. A WSL repo's error is usually about the
+/// distro, so it says nothing about the repo: its empty status mustn't read as "no origin".
+fn repo_known(status: Option<&RepoStatus>, in_wsl: bool) -> bool {
+    status.is_some_and(|status| !in_wsl || status.error.is_none())
+}
+
+/// Why a project can't run right now. A stopped distro isn't a reason, since a run wakes it, and
+/// the tools were last checked before it stopped, so the check at Prepare has the final word.
+fn project_blocker(default_branch: &str, known: bool, status: &RepoStatus, tooling: &Tooling) -> Option<String> {
+    if known && !status.has_origin {
+        return Some("This repo has no origin remote, so the pipeline has nowhere to push.".to_string());
+    }
+    if known && !status.has_makefile {
+        return Some(format!("origin/{default_branch} has no Makefile, and `make test` is what every run has to pass."));
+    }
+    match tooling {
+        Tooling::Native { claude_found: false, .. } => {
+            Some("Could not find the claude binary. Set claude_path in config.toml.".to_string())
+        }
+        Tooling::Native { gh_status: Some(Err(error)), .. } => {
+            let reason = if error.contains("could not run") { "isn't installed" } else { "isn't logged in" };
+            Some(format!("The GitHub CLI {reason}. It's needed to watch CI and publish releases."))
+        }
+        Tooling::Native { .. } => None,
+        Tooling::Wsl { on_windows_drive: true, .. } => Some(wsl::WINDOWS_DRIVE_NOTICE.to_string()),
+        Tooling::Wsl { distro, state, tools, .. } => {
+            let state: Option<&DistroState> = *state;
+            match state {
+                Some(DistroState::Stopped) => None,
+                Some(DistroState::Unavailable(_)) => state.and_then(|state| state.label(distro)),
+                _ => match tools {
+                    Some(Ok(check)) => check.problem(distro, true),
+                    Some(Err(error)) => Some(wsl::could_not_check(distro, error)),
+                    None => None,
+                },
+            }
+        }
+    }
+}
+
+/// *Create Makefile* needs an agent but, not being a full run, doesn't need `gh`.
+fn can_create_makefile(tooling: &Tooling) -> bool {
+    match tooling {
+        Tooling::Native { claude_found, .. } => *claude_found,
+        Tooling::Wsl { on_windows_drive: true, .. } | Tooling::Wsl { state: Some(DistroState::Unavailable(_)), .. } => false,
+        Tooling::Wsl { state: Some(DistroState::Stopped), .. } => true,
+        Tooling::Wsl { distro, tools, .. } => match tools {
+            Some(Ok(check)) => check.problem(distro, false).is_none(),
+            _ => true,
+        },
+    }
+}
+
+/// The WSL half of a status refresh. Looks at which distros are running first, so that an automatic
+/// refresh leaves a stopped one stopped. Everything it decides arrives through the channels.
+fn refresh_distros(
+    projects: Vec<(String, PathBuf, String)>,
+    manual: bool,
+    status_tx: Sender<(PathBuf, RepoStatus)>,
+    wsl_tx: Sender<WslEvent>,
+    ctx: egui::Context,
+) {
+    let listing = wsl::list_running();
+    let mut distros: Vec<&str> = projects.iter().map(|(distro, _, _)| distro.as_str()).collect();
+    distros.sort_unstable();
+    distros.dedup();
+    for distro in distros {
+        let state = wsl::refresh_decision(manual, &listing, distro);
+        let available = state == DistroState::Available;
+        let _ = wsl_tx.send(WslEvent::State(distro.to_string(), state));
+        ctx.request_repaint();
+        if !available {
+            continue;
+        }
+        let in_distro: Vec<(PathBuf, String)> =
+            projects.iter().filter(|(name, _, _)| name == distro).map(|(_, path, branch)| (path.clone(), branch.clone())).collect();
+        let distro = distro.to_string();
+        let (status_tx, wsl_tx, ctx) = (status_tx.clone(), wsl_tx.clone(), ctx.clone());
+        thread::spawn(move || {
+            if manual {
+                wsl::refresh_env(&distro);
+            }
+            let _ = wsl_tx.send(WslEvent::Tools(distro.clone(), wsl::check_tools(&distro)));
+            ctx.request_repaint();
+            for (path, default_branch) in in_distro {
+                let (tx, ctx) = (status_tx.clone(), ctx.clone());
+                thread::spawn(move || {
+                    let status = git::status(&path, &default_branch);
+                    let _ = tx.send((path, status));
+                    ctx.request_repaint();
+                });
+            }
+        });
+    }
+}
+
 pub struct App {
     paths: Paths,
     config: Config,
@@ -115,6 +235,11 @@ pub struct App {
     statuses: HashMap<PathBuf, RepoStatus>,
     status_tx: Sender<(PathBuf, RepoStatus)>,
     status_rx: mpsc::Receiver<(PathBuf, RepoStatus)>,
+    /// Apart from `statuses`, so a stopped distro doesn't disturb its projects' last known status.
+    distro_states: HashMap<String, DistroState>,
+    distro_tools: HashMap<String, Result<ToolCheck, String>>,
+    wsl_tx: Sender<WslEvent>,
+    wsl_rx: mpsc::Receiver<WslEvent>,
     last_refresh: Option<Instant>,
     runs: Vec<RunEntry>,
     selected_run: Option<String>,
@@ -235,6 +360,7 @@ impl App {
             .collect();
         let (status_tx, status_rx) = mpsc::channel();
         let (gh_tx, gh_rx) = mpsc::channel();
+        let (wsl_tx, wsl_rx) = mpsc::channel();
         let updater = Updater::detect(&paths.data_dir);
         Self {
             paths,
@@ -249,6 +375,10 @@ impl App {
             statuses: HashMap::new(),
             status_tx,
             status_rx,
+            distro_states: HashMap::new(),
+            distro_tools: HashMap::new(),
+            wsl_tx,
+            wsl_rx,
             last_refresh: None,
             runs,
             selected_run: None,
@@ -321,11 +451,18 @@ impl App {
         }
     }
 
-    fn refresh_statuses(&mut self, ctx: &egui::Context) {
+    /// `manual` is for something the user just did, which may wake a stopped distro. The timer's
+    /// refreshes never do.
+    fn refresh_statuses(&mut self, ctx: &egui::Context, manual: bool) {
         self.last_refresh = Some(Instant::now());
+        let mut in_distros = Vec::new();
         for project in &self.config.projects {
             let path = project.path.clone();
             let default_branch = project.default_branch.clone();
+            if let Some(target) = wsl::target(&path) {
+                in_distros.push((target.distro, path, default_branch));
+                continue;
+            }
             let tx = self.status_tx.clone();
             let ctx = ctx.clone();
             thread::spawn(move || {
@@ -333,6 +470,10 @@ impl App {
                 let _ = tx.send((path, status));
                 ctx.request_repaint();
             });
+        }
+        if !in_distros.is_empty() {
+            let (status_tx, wsl_tx, ctx) = (self.status_tx.clone(), self.wsl_tx.clone(), ctx.clone());
+            thread::spawn(move || refresh_distros(in_distros, manual, status_tx, wsl_tx, ctx));
         }
         // Look again each time, so installing gh takes effect without restarting the app.
         self.gh = locate_gh();
@@ -349,14 +490,32 @@ impl App {
         let Some(folder) = rfd::FileDialog::new().set_title("Add a repo, or a folder of repos").pick_folder() else {
             return;
         };
+        if wsl::is_on_windows_drive(&folder) {
+            self.notice = Some(wsl::WINDOWS_DRIVE_NOTICE.to_string());
+            return;
+        }
+        if wsl::target(&folder).is_some() {
+            // Reading the distro's PATH can take as long as its boot, so not on the UI thread.
+            let (tx, ctx) = (self.wsl_tx.clone(), ctx.clone());
+            thread::spawn(move || {
+                let found = config::discover(&folder);
+                let _ = tx.send(WslEvent::Added(folder, found));
+                ctx.request_repaint();
+            });
+            return;
+        }
         let found = config::discover(&folder);
+        self.add_found(ctx, &folder, found);
+    }
+
+    fn add_found(&mut self, ctx: &egui::Context, folder: &std::path::Path, found: Vec<Project>) {
         if found.is_empty() {
             self.notice = Some(format!("No git repos found at {}", folder.display()));
             return;
         }
         let mut added = 0;
         for project in found {
-            if !self.config.projects.iter().any(|p| p.path == project.path) {
+            if !self.config.projects.iter().any(|p| wsl::same_path(&p.path, &project.path)) {
                 self.config.projects.push(project);
                 added += 1;
             }
@@ -364,12 +523,17 @@ impl App {
         self.notice = Some(format!("Added {added} project(s)"));
         self.selected = self.selected.or(Some(0));
         self.save_config();
-        self.refresh_statuses(ctx);
+        self.refresh_statuses(ctx, true);
     }
 
     fn start_run(&mut self, ctx: &egui::Context, project: Project, kind: RunKind) {
-        let agent: Arc<dyn Agent> = match &self.claude {
-            Some(program) => Arc::new(ClaudeCli { program: program.clone() }),
+        // A distro has its own claude, so the Windows one doesn't matter to a WSL project.
+        let program = match &self.claude {
+            Some(program) => Some(program.clone()),
+            None => wsl::target(&project.path).map(|_| PathBuf::from("claude")),
+        };
+        let agent: Arc<dyn Agent> = match program {
+            Some(program) => Arc::new(ClaudeCli { program }),
             None => {
                 self.notice = Some("Could not find the claude binary".to_string());
                 return;
@@ -415,6 +579,12 @@ impl App {
         project_dot(&records)
     }
 
+    /// `<distro> is stopped`, or why WSL can't be used, if either applies.
+    fn distro_note(&self, distro: Option<&str>) -> Option<String> {
+        let distro = distro?;
+        self.distro_states.get(distro)?.label(distro)
+    }
+
     fn project_list(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
@@ -424,7 +594,7 @@ impl App {
                     self.add_projects(ui.ctx());
                 }
                 if ui.button("Refresh").clicked() {
-                    self.refresh_statuses(ui.ctx());
+                    self.refresh_statuses(ui.ctx(), true);
                 }
             });
         });
@@ -448,6 +618,14 @@ impl App {
                         self.build_bump = Bump::Patch;
                     }
                 });
+                let distro = wsl::target(&path).map(|target| target.distro);
+                let distro_note = self.distro_note(distro.as_deref());
+                if let Some(distro) = &distro {
+                    ui.small(format!("WSL: {distro}"));
+                }
+                if let Some(note) = &distro_note {
+                    ui.label(RichText::new(note).small().color(AMBER));
+                }
                 match self.statuses.get(&path) {
                     Some(status) => {
                         ui.small(status_summary(status));
@@ -455,6 +633,8 @@ impl App {
                             ui.add(egui::Label::new(RichText::new(&status.last_commit).small().weak()).truncate());
                         }
                     }
+                    // A stopped distro's status isn't on its way, so there's nothing to wait for.
+                    None if distro_note.is_some() => {}
                     None => {
                         ui.small("…");
                     }
@@ -491,27 +671,35 @@ impl App {
         }
         ui.separator();
 
-        let known = self.statuses.contains_key(&project.path);
-        let needs_makefile = known && status.has_origin && !status.has_makefile;
-        let blocker = if known && !status.has_origin {
-            Some("This repo has no origin remote, so the pipeline has nowhere to push.".to_string())
-        } else if needs_makefile {
-            Some(format!("origin/{} has no Makefile, and `make test` is what every run has to pass.", project.default_branch))
-        } else if self.claude.is_none() {
-            Some("Could not find the claude binary. Set claude_path in config.toml.".to_string())
-        } else if let Some(Err(error)) = &self.gh_status {
-            let reason = if error.contains("could not run") { "isn't installed" } else { "isn't logged in" };
-            Some(format!("The GitHub CLI {reason}. It's needed to watch CI and publish releases."))
-        } else {
-            None
+        let target = wsl::target(&project.path);
+        if let Some(target) = &target {
+            ui.horizontal(|ui| {
+                ui.weak(format!("WSL: {}", target.distro));
+                if self.distro_states.get(&target.distro) == Some(&DistroState::Stopped) {
+                    ui.colored_label(AMBER, DistroState::Stopped.label(&target.distro).unwrap_or_default());
+                }
+            });
+        }
+        let tooling = match &target {
+            Some(target) => Tooling::Wsl {
+                distro: &target.distro,
+                on_windows_drive: target.is_on_windows_drive(),
+                state: self.distro_states.get(&target.distro),
+                tools: self.distro_tools.get(&target.distro),
+            },
+            None => Tooling::Native { claude_found: self.claude.is_some(), gh_status: self.gh_status.as_ref() },
         };
+        let known = repo_known(self.statuses.get(&project.path), target.is_some());
+        let needs_makefile = known && status.has_origin && !status.has_makefile;
+        let blocker = project_blocker(&project.default_branch, known, &status, &tooling);
+        let makefile_enabled = can_create_makefile(&tooling);
         if let Some(blocker) = &blocker {
             ui.colored_label(AMBER, blocker);
         }
         if needs_makefile {
             let label = format!("Create Makefile and push to {}", project.default_branch);
             let hint = "An agent writes it from the project's tests and CI, and it has to pass before it's pushed";
-            let enabled = self.claude.is_some();
+            let enabled = makefile_enabled;
             if ui.add_enabled(enabled, egui::Button::new(label)).on_hover_text(hint).clicked() {
                 self.start_run(ui.ctx(), project.clone(), RunKind::CreateMakefile);
             }
@@ -716,7 +904,7 @@ impl App {
                     open_folder(worktree);
                 }
                 if ui.button("Discard worktree").clicked() {
-                    self.discard(position, project);
+                    self.discard(ui.ctx(), position, project);
                 }
             }
             if ui.button("Copy log").clicked() {
@@ -799,7 +987,27 @@ impl App {
         }
     }
 
-    fn discard(&mut self, position: usize, project: &Project) {
+    fn discard(&mut self, ctx: &egui::Context, position: usize, project: &Project) {
+        if wsl::target(&project.path).is_some() {
+            // Removing it can wake the distro, so not on the UI thread and not holding the lock.
+            let state = self.runs[position].state.clone();
+            let mut record = state.lock().unwrap().record.clone();
+            let (repo, paths, tx, ctx) = (project.path.clone(), self.paths.clone(), self.wsl_tx.clone(), ctx.clone());
+            thread::spawn(move || {
+                let result = pipeline::discard(&repo, &mut record);
+                {
+                    let mut state = state.lock().unwrap();
+                    state.record.worktree = record.worktree;
+                    state.record.branch = record.branch;
+                    let _ = pipeline::save(&paths, &state.record);
+                }
+                if let Err(error) = result {
+                    let _ = tx.send(WslEvent::Notice(format!("Could not discard worktree: {error}")));
+                }
+                ctx.request_repaint();
+            });
+            return;
+        }
         let result = {
             let mut state = self.runs[position].state.lock().unwrap();
             let result = pipeline::discard(&project.path, &mut state.record);
@@ -922,12 +1130,24 @@ impl eframe::App for App {
         while let Ok(status) = self.gh_rx.try_recv() {
             self.gh_status = Some(status);
         }
+        while let Ok(event) = self.wsl_rx.try_recv() {
+            match event {
+                WslEvent::State(distro, state) => {
+                    self.distro_states.insert(distro, state);
+                }
+                WslEvent::Tools(distro, tools) => {
+                    self.distro_tools.insert(distro, tools);
+                }
+                WslEvent::Added(folder, found) => self.add_found(&ctx, &folder, found),
+                WslEvent::Notice(notice) => self.notice = Some(notice),
+            }
+        }
         let running = self.running_count();
         // A run just finished, so the repo it pushed from may look different.
         let run_finished = running < self.running_last_frame;
         self.running_last_frame = running;
         if run_finished || self.last_refresh.is_none_or(|at| at.elapsed() >= REFRESH_EVERY) {
-            self.refresh_statuses(&ctx);
+            self.refresh_statuses(&ctx, false);
         }
         ctx.request_repaint_after(REFRESH_EVERY);
 
@@ -986,6 +1206,102 @@ impl eframe::App for App {
 mod tests {
     use super::*;
     use crate::pipeline::Wait;
+
+    fn good_repo() -> RepoStatus {
+        RepoStatus { has_origin: true, has_makefile: true, ..Default::default() }
+    }
+
+    fn native(claude_found: bool, gh: Option<&Result<(), String>>) -> Tooling<'_> {
+        Tooling::Native { claude_found, gh_status: gh }
+    }
+
+    fn in_ubuntu<'a>(state: Option<&'a DistroState>, tools: Option<&'a Result<ToolCheck, String>>) -> Tooling<'a> {
+        Tooling::Wsl { distro: "Ubuntu", on_windows_drive: false, state, tools }
+    }
+
+    fn blocker(tooling: &Tooling) -> Option<String> {
+        project_blocker("main", true, &good_repo(), tooling)
+    }
+
+    #[test]
+    fn native_blockers_come_from_the_windows_tools() {
+        let not_installed = Err("could not run gh: not found".to_string());
+        let logged_out = Err("HTTP 401".to_string());
+        assert_eq!(blocker(&native(true, Some(&Ok(())))), None);
+        assert_eq!(blocker(&native(true, None)), None);
+        assert!(blocker(&native(false, None)).unwrap().contains("claude binary"));
+        assert!(blocker(&native(true, Some(&not_installed))).unwrap().contains("isn't installed"));
+        assert!(blocker(&native(true, Some(&logged_out))).unwrap().contains("isn't logged in"));
+    }
+
+    #[test]
+    fn repo_blockers_come_first_for_any_project() {
+        let tooling = native(false, None);
+        let no_origin = RepoStatus::default();
+        assert!(project_blocker("main", true, &no_origin, &tooling).unwrap().contains("no origin"));
+        let no_makefile = RepoStatus { has_origin: true, ..Default::default() };
+        assert!(project_blocker("dev", true, &no_makefile, &tooling).unwrap().contains("origin/dev has no Makefile"));
+    }
+
+    #[test]
+    fn the_windows_tools_are_not_needed_for_a_wsl_project() {
+        let available = DistroState::Available;
+        let fine = Ok(ToolCheck { missing: Vec::new(), gh_logged_in: true });
+        let tooling = in_ubuntu(Some(&available), Some(&fine));
+        assert_eq!(blocker(&tooling), None);
+        assert!(can_create_makefile(&tooling));
+    }
+
+    #[test]
+    fn a_distro_missing_tools_blocks_with_its_name_and_a_makefile_only_needs_the_agent() {
+        let available = DistroState::Available;
+        let no_gh = Ok(ToolCheck { missing: vec!["gh".into()], gh_logged_in: false });
+        let tooling = in_ubuntu(Some(&available), Some(&no_gh));
+        let text = blocker(&tooling).unwrap();
+        assert!(text.contains("Ubuntu") && text.contains("gh"), "{text}");
+        assert!(can_create_makefile(&tooling));
+
+        let no_claude = Ok(ToolCheck { missing: vec!["claude".into()], gh_logged_in: true });
+        let tooling = in_ubuntu(Some(&available), Some(&no_claude));
+        assert!(blocker(&tooling).unwrap().contains("claude"));
+        assert!(!can_create_makefile(&tooling));
+
+        let failed = Err("no output from the distro".to_string());
+        let text = blocker(&in_ubuntu(Some(&available), Some(&failed))).unwrap();
+        assert_eq!(text, "Could not check the tools in Ubuntu: no output from the distro");
+    }
+
+    #[test]
+    fn a_stopped_distro_is_not_a_blocker_even_with_an_old_or_empty_status() {
+        let stopped = DistroState::Stopped;
+        let old_problem = Ok(ToolCheck { missing: vec!["make".into()], gh_logged_in: false });
+        let tooling = in_ubuntu(Some(&stopped), Some(&old_problem));
+        assert_eq!(blocker(&tooling), None);
+        assert!(can_create_makefile(&tooling));
+
+        // With no status yet, or only an error from the distro, nothing is known about the repo.
+        assert!(!repo_known(None, true));
+        let errored = RepoStatus { error: Some("wsl.exe failed".into()), ..Default::default() };
+        assert!(!repo_known(Some(&errored), true));
+        assert_eq!(project_blocker("main", repo_known(Some(&errored), true), &errored, &tooling), None);
+        assert!(repo_known(Some(&good_repo()), true));
+        assert!(repo_known(Some(&errored), false), "native projects keep treating it as known");
+    }
+
+    #[test]
+    fn wsl_being_unavailable_blocks_with_its_own_message() {
+        let unavailable = DistroState::Unavailable("not installed".into());
+        let tooling = in_ubuntu(Some(&unavailable), None);
+        assert_eq!(blocker(&tooling).unwrap(), "WSL isn't available: not installed");
+        assert!(!can_create_makefile(&tooling));
+    }
+
+    #[test]
+    fn a_project_saved_on_a_windows_drive_is_blocked() {
+        let tooling = Tooling::Wsl { distro: "Ubuntu", on_windows_drive: true, state: None, tools: None };
+        assert_eq!(blocker(&tooling).unwrap(), wsl::WINDOWS_DRIVE_NOTICE);
+        assert!(!can_create_makefile(&tooling));
+    }
 
     #[test]
     fn the_hint_only_mentions_the_grill_when_it_will_run() {

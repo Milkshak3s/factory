@@ -2,12 +2,15 @@
 //! user's real PATH when launched from a desktop.
 
 use std::ffi::OsStr;
-use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
-use std::process::{Child, Command, Stdio};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
+use std::path::Path;
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use crate::wsl;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -62,14 +65,15 @@ pub fn adopt_login_path() {
     unsafe { std::env::set_var("PATH", merged) };
 }
 
-fn login_shell_command(shell: &str) -> Command {
+pub(crate) fn login_shell_command(shell: &str) -> Command {
     let mut cmd = command(shell);
     cmd.args(["-l", "-i", "-c"]).arg(format!("printf '%s%s%s' '{PATH_BEGIN}' \"$PATH\" '{PATH_END}'"));
     cmd
 }
 
 /// Runs `cmd` and returns the PATH it prints between the markers, or `None` on failure or timeout.
-fn read_marked_path(mut cmd: Command, timeout: Duration) -> Option<String> {
+pub(crate) fn read_marked_path(cmd: Command, timeout: Duration) -> Option<String> {
+    let (mut cmd, session) = wsl::into_session(cmd);
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     own_process_group(&mut cmd);
     let mut child = cmd.spawn().ok()?;
@@ -92,12 +96,12 @@ fn read_marked_path(mut cmd: Command, timeout: Duration) -> Option<String> {
         match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(chunk) => {
                 output.extend(chunk);
-                if let Some(path) = parse_marked_path(&String::from_utf8_lossy(&output)) {
+                if let Some(path) = parse_marked_path(&String::from_utf8_lossy(&output).replace('\0', "")) {
                     break path;
                 }
             }
             Err(_) => {
-                kill_tree(&mut child);
+                kill_tree(&mut child, session.as_ref());
                 return None;
             }
         }
@@ -110,7 +114,7 @@ fn read_marked_path(mut cmd: Command, timeout: Duration) -> Option<String> {
             _ => return Some(found),
         }
     }
-    kill_tree(&mut child);
+    kill_tree(&mut child, session.as_ref());
     Some(found)
 }
 
@@ -123,7 +127,7 @@ fn parse_marked_path(output: &str) -> Option<String> {
 }
 
 /// The login PATH, then the inherited one, then the usual install directories, without repeats.
-fn merge_path(login: Option<&str>, inherited: &str, home: &str) -> String {
+pub(crate) fn merge_path(login: Option<&str>, inherited: &str, home: &str) -> String {
     let mut known = vec!["/opt/homebrew/bin".to_string(), "/usr/local/bin".to_string()];
     if !home.is_empty() {
         known.extend([".local/bin", ".cargo/bin", ".claude/local"].map(|dir| format!("{home}/{dir}")));
@@ -155,6 +159,56 @@ pub fn shell(line: &str) -> Command {
     }
 }
 
+/// Runs a user-configured command line in `dir`: through `sh` inside the distro for a WSL path,
+/// otherwise through the platform shell. Set any env on it, then pass it to `wsl::route`.
+pub fn shell_in(dir: &Path, line: &str) -> Command {
+    let mut cmd = if wsl::target(dir).is_some() {
+        let mut cmd = command("sh");
+        cmd.arg("-c").arg(line);
+        cmd
+    } else {
+        shell(line)
+    };
+    cmd.current_dir(dir);
+    cmd
+}
+
+/// Runs `cmd` to completion and collects its output, killing it if `timeout` passes first.
+pub(crate) fn output_timeout(mut cmd: Command, timeout: Duration) -> io::Result<Output> {
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    // Read on threads: a full pipe would stall the child, and a daemon can hold one open forever.
+    fn collect(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            let _ = tx.send(bytes);
+        });
+        rx
+    }
+    let stdout = collect(child.stdout.take().expect("stdout is piped"));
+    let stderr = collect(child.stderr.take().expect("stderr is piped"));
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            kill_tree(&mut child, None);
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "timed out"));
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let grace = Duration::from_millis(500);
+    Ok(Output {
+        status,
+        stdout: stdout.recv_timeout(grace).unwrap_or_default(),
+        stderr: stderr.recv_timeout(grace).unwrap_or_default(),
+    })
+}
+
 #[derive(Clone, Default)]
 pub struct Cancel(Arc<AtomicBool>);
 
@@ -174,7 +228,7 @@ pub enum Exit {
     Cancelled,
 }
 
-fn pump(pipe: impl Read + Send + 'static, tx: mpsc::Sender<String>) {
+fn pump(pipe: impl Read + Send + 'static, tx: mpsc::Sender<String>, strip_nul: bool) {
     thread::spawn(move || {
         let mut reader = BufReader::new(pipe);
         let mut buf = Vec::new();
@@ -183,7 +237,10 @@ fn pump(pipe: impl Read + Send + 'static, tx: mpsc::Sender<String>) {
             match reader.read_until(b'\n', &mut buf) {
                 Ok(0) | Err(_) => return,
                 Ok(_) => {
-                    let line = String::from_utf8_lossy(&buf);
+                    let mut line = String::from_utf8_lossy(&buf).into_owned();
+                    if strip_nul {
+                        line.retain(|c| c != '\0');
+                    }
                     if tx.send(line.trim_end().to_string()).is_err() {
                         return;
                     }
@@ -204,7 +261,11 @@ fn tree_kill_command(windows: bool, pid: u32) -> (&'static str, Vec<String>) {
     }
 }
 
-fn kill_tree(child: &mut Child) {
+/// `session` is what's running inside a distro, which killing the Windows process can leave behind.
+fn kill_tree(child: &mut Child, session: Option<&wsl::Session>) {
+    if let Some(session) = session {
+        wsl::kill_session(session);
+    }
     // Test runners and agents spawn their own children, which Child::kill would orphan. The child
     // hasn't been reaped yet, so its PID, and so its group's ID, can't have been reused.
     let (program, args) = tree_kill_command(cfg!(windows), child.id());
@@ -215,11 +276,12 @@ fn kill_tree(child: &mut Child) {
 
 /// Runs `cmd`, handing each stdout/stderr line to `on_line` as it arrives.
 pub fn run_streaming(
-    mut cmd: Command,
+    cmd: Command,
     input: Option<String>,
     cancel: &Cancel,
     on_line: &mut dyn FnMut(&str),
 ) -> std::io::Result<Exit> {
+    let (mut cmd, session) = wsl::into_session(cmd);
     cmd.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -233,8 +295,8 @@ pub fn run_streaming(
     }
 
     let (tx, rx) = mpsc::channel();
-    pump(child.stdout.take().expect("stdout is piped"), tx.clone());
-    pump(child.stderr.take().expect("stderr is piped"), tx);
+    pump(child.stdout.take().expect("stdout is piped"), tx.clone(), session.is_some());
+    pump(child.stderr.take().expect("stderr is piped"), tx, session.is_some());
 
     loop {
         match rx.recv_timeout(Duration::from_millis(100)) {
@@ -243,7 +305,7 @@ pub fn run_streaming(
             Err(mpsc::RecvTimeoutError::Disconnected) => thread::sleep(Duration::from_millis(50)),
         }
         if cancel.is_cancelled() {
-            kill_tree(&mut child);
+            kill_tree(&mut child, session.as_ref());
             return Ok(Exit::Cancelled);
         }
         if let Some(status) = child.try_wait()? {
@@ -313,6 +375,26 @@ mod tests {
         let (program, args) = tree_kill_command(false, 42);
         assert_eq!(program, "kill");
         assert_eq!(args, ["-KILL", "--", "-42"]);
+    }
+
+    #[test]
+    fn a_wsl_directory_gets_sh_and_any_other_keeps_the_platform_shell() {
+        let cmd = shell_in(Path::new(r"\\wsl.localhost\Ubuntu\home\jo\repo"), "npm ci && npm test");
+        assert_eq!(cmd.get_program(), "sh");
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args, ["-c", "npm ci && npm test"]);
+
+        let native = shell_in(Path::new("some-dir"), "make test");
+        assert_eq!(native.get_program(), shell("make test").get_program());
+        assert_eq!(native.get_current_dir(), Some(Path::new("some-dir")));
+    }
+
+    #[test]
+    fn output_is_collected_and_a_missing_program_is_an_error() {
+        let output = output_timeout(shell("echo hello"), Duration::from_secs(30)).unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("hello"));
+        assert!(output_timeout(command("factory-no-such-program"), Duration::from_secs(30)).is_err());
     }
 
     #[cfg(unix)]

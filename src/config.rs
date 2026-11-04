@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::git;
+use crate::wsl;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -66,15 +67,20 @@ impl Project {
 }
 
 /// Repos to add for a picked folder: the folder itself, or else the repos directly inside it.
+/// WSL paths come back in their one normal form, and those on a Windows drive are left out.
 pub fn discover(folder: &Path) -> Vec<Project> {
-    if git::is_repo(folder) {
-        return vec![Project::detect(folder)];
+    if wsl::is_on_windows_drive(folder) {
+        return Vec::new();
     }
-    let Ok(entries) = fs::read_dir(folder) else { return Vec::new() };
+    let folder = wsl::normalise(folder);
+    if git::is_repo(&folder) {
+        return vec![Project::detect(&folder)];
+    }
+    let Ok(entries) = fs::read_dir(&folder) else { return Vec::new() };
     let mut found: Vec<_> = entries
         .flatten()
         .map(|entry| entry.path())
-        .filter(|path| path.join(".git").exists())
+        .filter(|path| !wsl::is_on_windows_drive(path) && path.join(".git").exists())
         .map(|path| Project::detect(&path))
         .collect();
     found.sort_by_key(|project| project.name.to_lowercase());
@@ -173,6 +179,12 @@ mod tests {
         let paths = paths_with(false, &vars);
         assert_eq!(paths.config_file, Path::new(r"C:\Users\Jo\AppData\Roaming").join("factory").join("config.toml"));
         assert_eq!(paths.data_dir, Path::new(r"C:\Users\Jo\AppData\Local").join("factory"));
+    }
+
+    #[test]
+    fn discovery_skips_a_distros_windows_drives_without_touching_the_distro() {
+        assert!(discover(Path::new(r"\\wsl.localhost\Ubuntu\mnt\c\repos")).is_empty());
+        assert!(discover(Path::new(r"\\wsl$\Ubuntu\mnt")).is_empty());
     }
 
     #[test]

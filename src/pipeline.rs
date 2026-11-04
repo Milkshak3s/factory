@@ -17,8 +17,9 @@ use crate::agent::{Agent, AgentRequest, AgentResult, Role};
 use crate::config::{Paths, Project};
 use crate::forge::Forge;
 use crate::git::{git, git_cmd, latest_tag, origin_url};
-use crate::proc::{Cancel, Exit, command, run_streaming, shell};
+use crate::proc::{Cancel, Exit, command, run_streaming, shell_in};
 use crate::version::{self, Bump, Manifest};
+use crate::wsl;
 
 /// The gate. Every project provides it, so the pipeline never has to guess how to test.
 pub const TEST_COMMAND: &str = "make test";
@@ -267,7 +268,10 @@ struct Run {
     replies: Mutex<mpsc::Receiver<GrillReply>>,
     log_file: Mutex<Option<File>>,
     id: String,
+    /// For a WSL project this is its UNC form, known only once `locate_in_distro` has run.
     worktree: PathBuf,
+    /// The Linux path of a WSL project's Cargo cache.
+    wsl_cargo_target: Option<String>,
     branch: String,
 }
 
@@ -326,7 +330,12 @@ fn new_run_id() -> String {
 
 pub fn start(project: Project, kind: RunKind, env: Env) -> RunHandle {
     let id = new_run_id();
-    let worktree = env.paths.data_dir.join("worktrees").join(project.slug()).join(&id);
+    // Finding a distro's home directory can boot it, so a WSL run does that on its own thread.
+    let worktree = if wsl::target(&project.path).is_some() {
+        PathBuf::new()
+    } else {
+        env.paths.data_dir.join("worktrees").join(project.slug()).join(&id)
+    };
     let branch = format!("factory/{id}");
     let record = RunRecord {
         id: id.clone(),
@@ -366,6 +375,7 @@ pub fn start(project: Project, kind: RunKind, env: Env) -> RunHandle {
         log_file: Mutex::new(log_file),
         id,
         worktree,
+        wsl_cargo_target: None,
         branch,
     };
     let thread = thread::spawn(move || run.execute(kind));
@@ -373,14 +383,17 @@ pub fn start(project: Project, kind: RunKind, env: Env) -> RunHandle {
 }
 
 impl Run {
-    fn execute(self, kind: RunKind) {
+    fn execute(mut self, kind: RunKind) {
         self.persist();
-        let outcome = catch_unwind(AssertUnwindSafe(|| match &kind {
-            RunKind::Build { task, bump } => self.build(task, *bump),
-            RunKind::Release { bump } => self.release_only(*bump),
-            RunKind::CreateMakefile => self.create_makefile(),
-        }))
-        .unwrap_or_else(|_| Err(Stop::Failed("the pipeline panicked".to_string())));
+        let located = self.locate_in_distro();
+        let outcome = located.and_then(|()| {
+            catch_unwind(AssertUnwindSafe(|| match &kind {
+                RunKind::Build { task, bump } => self.build(task, *bump),
+                RunKind::Release { bump } => self.release_only(*bump),
+                RunKind::CreateMakefile => self.create_makefile(),
+            }))
+            .unwrap_or_else(|_| Err(Stop::Failed("the pipeline panicked".to_string())))
+        });
 
         let (status, error) = match outcome {
             Ok(()) => (RunStatus::Succeeded, None),
@@ -401,6 +414,20 @@ impl Run {
             record.waiting_on = None;
             record.finished_at = Some(Local::now().to_rfc3339());
         });
+    }
+
+    /// For a WSL project: wakes the distro, re-reads its PATH and places this run under its home.
+    fn locate_in_distro(&mut self) -> Result<(), Stop> {
+        let Some(target) = wsl::target(&self.project.path) else { return Ok(()) };
+        self.set_wait(format!("Waiting for {}", target.distro));
+        let home = wsl::refresh_env(&target.distro).home.ok_or_else(|| {
+            Stop::Failed(format!("Could not find your home directory in {}. Is the distro working?", target.distro))
+        })?;
+        let slug = self.project.slug();
+        let worktree = wsl::worktree_dir(&home, &slug, &self.id);
+        self.worktree = wsl::to_unc(&target.distro, &worktree);
+        self.wsl_cargo_target = Some(wsl::cargo_target_dir(&home, &slug));
+        Ok(())
     }
 
     fn update(&self, change: impl FnOnce(&mut RunRecord)) {
@@ -483,8 +510,7 @@ impl Run {
     fn shell_stage(&self, line: &str, envs: &[(String, String)]) -> Result<(bool, String), Stop> {
         self.log(&format!("$ {line}"));
         self.set_wait(format!("Waiting for `{}`", first_line(line)));
-        let mut cmd = shell(line);
-        cmd.current_dir(&self.worktree).envs(envs.iter().map(|(k, v)| (k, v)));
+        let cmd = shell_stage_command(&self.worktree, line, envs);
         let mut output = Vec::new();
         let passed = self.stream(cmd, None, &mut |text| {
             self.log(text);
@@ -497,8 +523,8 @@ impl Run {
     /// Build tools get a per-project cache, since each run's worktree starts empty.
     fn build_env(&self) -> Vec<(String, String)> {
         if self.worktree.join("Cargo.toml").exists() {
-            let dir = self.env.paths.data_dir.join("target").join(self.project.slug());
-            vec![("CARGO_TARGET_DIR".to_string(), dir.to_string_lossy().into_owned())]
+            let dir = cargo_target_value(self.wsl_cargo_target.as_deref(), &self.env.paths.data_dir, &self.project.slug());
+            vec![("CARGO_TARGET_DIR".to_string(), dir)]
         } else {
             Vec::new()
         }
@@ -508,6 +534,10 @@ impl Run {
     /// `full` also checks what a whole run needs, before any agent time is spent.
     fn prepare(&self, full: bool) -> Result<String, Stop> {
         let repo = &self.project.path;
+        if let Some(target) = wsl::target(repo) {
+            self.set_wait(format!("Waiting for the tool check in {}", target.distro));
+            wsl::require_tools(&target, full)?;
+        }
         if origin_url(repo).is_none() {
             return Err(Stop::Failed("This repo has no `origin` remote to push to".into()));
         }
@@ -524,7 +554,7 @@ impl Run {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let _ = git(repo, &["worktree", "prune"]);
-        let path = self.worktree.to_string_lossy().into_owned();
+        let path = wsl::tool_path(&self.worktree);
         self.git_stream(repo, &["worktree", "add", "--detach", &path, &base_sha])?;
         self.update(|record| record.worktree = Some(self.worktree.clone()));
 
@@ -561,9 +591,7 @@ impl Run {
 
     fn make_has_test_target(&self) -> Result<bool, Stop> {
         self.set_wait("Waiting for `make -n test`");
-        let mut cmd = command("make");
-        cmd.current_dir(&self.worktree).args(["-n", "test"]);
-        self.stream(cmd, None, &mut |_| {})
+        self.stream(make_check_command(&self.worktree), None, &mut |_| {})
     }
 
     fn setup(&self) -> Result<(), Stop> {
@@ -1082,6 +1110,26 @@ impl Run {
     }
 }
 
+fn shell_stage_command(dir: &Path, line: &str, envs: &[(String, String)]) -> std::process::Command {
+    let mut cmd = shell_in(dir, line);
+    cmd.envs(envs.iter().map(|(k, v)| (k, v)));
+    wsl::route(cmd)
+}
+
+fn make_check_command(dir: &Path) -> std::process::Command {
+    let mut cmd = command("make");
+    cmd.current_dir(dir).args(["-n", "test"]);
+    wsl::route(cmd)
+}
+
+/// A WSL run's cache is on the Linux side. Anything else keeps it in the data folder.
+fn cargo_target_value(wsl_target: Option<&str>, data_dir: &Path, slug: &str) -> String {
+    match wsl_target {
+        Some(dir) => dir.to_string(),
+        None => data_dir.join("target").join(slug).to_string_lossy().into_owned(),
+    }
+}
+
 /// Only the subcommand: the full arguments are noise here, and they're in the log anyway.
 fn git_wait_label(args: &[&str]) -> String {
     format!("Waiting for `git {}`", args.first().copied().unwrap_or_default())
@@ -1133,7 +1181,7 @@ fn only_bullets(text: &str) -> String {
 /// Removes a run's worktree and local branch. Anything already pushed is untouched.
 pub fn discard(repo: &Path, record: &mut RunRecord) -> Result<(), String> {
     if let Some(worktree) = &record.worktree {
-        git(repo, &["worktree", "remove", "--force", &worktree.to_string_lossy()])?;
+        git(repo, &["worktree", "remove", "--force", &wsl::tool_path(worktree)])?;
     }
     record.worktree = None;
     if let Some(branch) = record.branch.take() {
@@ -1479,6 +1527,90 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(30), "never saw: {what}");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn args_of(cmd: &std::process::Command) -> Vec<String> {
+        cmd.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect()
+    }
+
+    /// A safety feature: if this env doesn't reach the Linux process, an agent's `git push` works.
+    #[test]
+    fn the_push_guard_reaches_the_agent_inside_the_distro() {
+        wsl::seed_env("GuardDistro", "/seeded/bin", "/home/jo");
+        let origin = "git@github.com:me/repo.git";
+        let guard = push_guard_env(Some(origin));
+        assert_eq!(guard[0].0, "GIT_CONFIG_COUNT");
+        let claude = crate::agent::ClaudeCli { program: PathBuf::from("claude") };
+        let request = AgentRequest {
+            role: Role::Build,
+            dir: Path::new(r"\\wsl.localhost\GuardDistro\home\jo\wt"),
+            prompt: String::new(),
+            resume: None,
+            model: "",
+            permission_mode: "acceptEdits",
+            allowed_tools: "",
+            env: guard.clone(),
+        };
+        let cmd = claude.command(&request);
+        assert_eq!(cmd.get_program(), "wsl.exe");
+        let args = args_of(&cmd);
+        let program = args.iter().position(|arg| arg == "claude").unwrap();
+        for (key, value) in &guard {
+            let pair = format!("{key}={value}");
+            let at = args.iter().position(|arg| *arg == pair).unwrap_or_else(|| panic!("{pair} is missing"));
+            assert!(at < program, "{pair} has to be given to env, ahead of the program");
+        }
+        assert!(args.contains(&format!("GIT_CONFIG_VALUE_4={origin}")));
+        assert!(args.contains(&"GIT_CONFIG_KEY_0=url.factory-push-blocked://agent/.pushInsteadOf".to_string()));
+
+        // And it has to survive the wrapper that lets a cancel find the process too.
+        let (cmd, session) = wsl::into_session(cmd);
+        assert!(session.is_some());
+        let args = args_of(&cmd);
+        let setsid = args.iter().position(|arg| arg == "setsid").unwrap();
+        for (key, value) in &guard {
+            let pair = format!("{key}={value}");
+            assert!(args.iter().position(|arg| *arg == pair).unwrap() < setsid, "{pair}");
+        }
+    }
+
+    #[test]
+    fn setup_tests_and_release_commands_run_under_sh_in_the_distro_with_their_env() {
+        wsl::seed_env("StageDistro", "/seeded/bin", "/home/jo");
+        let dir = Path::new(r"\\wsl.localhost\StageDistro\home\jo\wt");
+        let env = [("FACTORY_TAG".to_string(), "v1.2.3".to_string()), ("CARGO_TARGET_DIR".to_string(), "/t".to_string())];
+        let cmd = shell_stage_command(dir, "make test", &env);
+        assert_eq!(cmd.get_program(), "wsl.exe");
+        let args = args_of(&cmd);
+        assert!(args.contains(&"FACTORY_TAG=v1.2.3".to_string()));
+        assert!(args.contains(&"CARGO_TARGET_DIR=/t".to_string()));
+        assert_eq!(args[args.len() - 3..], ["sh", "-c", "make test"]);
+        assert!(!args.iter().any(|arg| arg == "cmd" || arg == "/C"));
+
+        let cmd = make_check_command(dir);
+        let args = args_of(&cmd);
+        assert_eq!(args[args.len() - 3..], ["make", "-n", "test"]);
+        assert_eq!(cmd.get_program(), "wsl.exe");
+    }
+
+    #[test]
+    fn native_stage_commands_are_left_alone() {
+        let cmd = make_check_command(Path::new("."));
+        assert_eq!(cmd.get_program(), "make");
+        assert_eq!(args_of(&cmd), ["-n", "test"]);
+        let cmd = shell_stage_command(Path::new("."), "make test", &[]);
+        assert_ne!(cmd.get_program(), "wsl.exe");
+        assert_eq!(cmd.get_current_dir(), Some(Path::new(".")));
+    }
+
+    #[test]
+    fn the_cargo_cache_is_on_the_linux_side_only_for_a_wsl_run() {
+        let data = Path::new("data");
+        assert_eq!(cargo_target_value(None, data, "demo"), data.join("target").join("demo").to_string_lossy());
+        assert_eq!(
+            cargo_target_value(Some("/home/jo/.local/share/factory/target/demo"), data, "demo"),
+            "/home/jo/.local/share/factory/target/demo"
+        );
     }
 
     #[test]
