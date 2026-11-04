@@ -1093,9 +1093,16 @@ mod tests {
         assert!(desktop.contains("StartupWMClass=factory"));
 
         let control = include_str!("../packaging/deb-control");
-        for package in ["git", "make", "libc6", "libgl1", "libegl1", "libxkbcommon0", "libx11-6", "libxcursor1", "libxi6", "libxrandr2", "libwayland-client0"] {
+        for package in ["git", "make", "libc6", "libgl1", "libegl1", "libxkbcommon0", "libx11-6", "libxcursor1", "libxi6", "libxrandr2", "libwayland-client0", "libfontconfig1"] {
             assert!(control.contains(package), "{package}");
         }
+    }
+
+    /// eframe's system font provider links fontconfig, whose build script fails without the headers.
+    #[test]
+    fn the_linux_job_and_the_readme_install_the_fontconfig_headers() {
+        assert!(include_str!("../.github/workflows/release.yml").contains("libfontconfig1-dev"));
+        assert!(include_str!("../README.md").contains("libfontconfig1-dev"));
     }
 
     #[test]

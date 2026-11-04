@@ -148,7 +148,7 @@ brew install make gh
 On Debian or Ubuntu, where a from-source build also needs the windowing libraries:
 
 ```bash
-sudo apt install make gh libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev libegl1-mesa-dev libwayland-dev
+sudo apt install make gh libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev libegl1-mesa-dev libwayland-dev libfontconfig1-dev
 ```
 
 Then, on every OS:

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds the AppImage from target/release/factory. No libraries are bundled, because eframe loads
-# X11, Wayland and GL from the host.
+# X11, Wayland, GL and fontconfig from the host.
 # Usage, from the repo root after `cargo build --release`:
 #   APPIMAGETOOL_VERSION=<tag> bash packaging/appimage.sh <version>
 set -euo pipefail
