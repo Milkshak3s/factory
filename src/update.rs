@@ -1057,6 +1057,20 @@ mod tests {
     }
 
     #[test]
+    fn every_build_job_caches_cargo_after_choosing_its_toolchain() {
+        let workflow = include_str!("../.github/workflows/release.yml");
+        let jobs: Vec<&str> = workflow.split("runs-on: ").skip(1).collect();
+        let builds: Vec<&&str> = jobs.iter().filter(|job| job.contains("cargo build --release")).collect();
+        assert_eq!(builds.len(), 3);
+        for job in builds {
+            let toolchain = job.find("rustup default stable").expect("toolchain step");
+            let cache = job.find("uses: Swatinem/rust-cache@").expect("cache step");
+            let first_cargo = job.find("cargo ").expect("cargo step");
+            assert!(toolchain < cache && cache < first_cargo, "{job}");
+        }
+    }
+
+    #[test]
     fn the_packaging_scripts_build_the_assets_the_updater_looks_for() {
         let macos = include_str!("../packaging/macos.sh");
         assert!(macos.contains(&asset_name("$version", &InstallKind::MacApp(PathBuf::new()))));
