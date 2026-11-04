@@ -14,8 +14,9 @@ env:
   WIX_VERSION: 6.0.2
   # Lets the pinned WiX tool run on whichever newer .NET runtime the runner has.
   DOTNET_ROLL_FORWARD: Major
-  # The tag on AppImage/AppImageKit that packaging/appimage.sh downloads.
-  APPIMAGETOOL_VERSION: "13"
+  # The tag on AppImage/appimagetool that packaging/appimage.sh downloads, and that file's checksum.
+  APPIMAGETOOL_VERSION: "1.9.1"
+  APPIMAGETOOL_SHA256: ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
 
 jobs:
   windows:

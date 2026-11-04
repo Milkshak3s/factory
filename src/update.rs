@@ -1069,8 +1069,11 @@ mod tests {
 
         let appimage = include_str!("../packaging/appimage.sh");
         assert!(appimage.contains(&asset_name("$version", &InstallKind::AppImage(PathBuf::new()))));
-        assert!(appimage.contains("$APPIMAGETOOL_VERSION"));
-        assert!(include_str!("../.github/workflows/release.yml").contains("APPIMAGETOOL_VERSION: \"13\""));
+        assert!(appimage.contains("AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/"));
+        assert!(appimage.contains("$APPIMAGETOOL_SHA256"));
+        let workflow = include_str!("../.github/workflows/release.yml");
+        assert!(workflow.contains("APPIMAGETOOL_VERSION: \"1.9.1\""));
+        assert!(workflow.contains("APPIMAGETOOL_SHA256: "));
 
         let deb = include_str!("../packaging/deb.sh");
         assert!(deb.contains(&asset_name("$version", &InstallKind::Deb)));

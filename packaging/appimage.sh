@@ -2,7 +2,7 @@
 # Builds the AppImage from target/release/factory. No libraries are bundled, because eframe loads
 # X11, Wayland, GL and fontconfig from the host.
 # Usage, from the repo root after `cargo build --release`:
-#   APPIMAGETOOL_VERSION=<tag> bash packaging/appimage.sh <version>
+#   APPIMAGETOOL_VERSION=<tag> APPIMAGETOOL_SHA256=<checksum> bash packaging/appimage.sh <version>
 set -euo pipefail
 
 version="$1"
@@ -18,7 +18,8 @@ install -m 644 packaging/factory.desktop "$appdir/factory.desktop"
 install -m 644 target/release/factory.png "$appdir/factory.png"
 
 curl --fail --location --silent --show-error --output "$tool" \
-  "https://github.com/AppImage/AppImageKit/releases/download/$APPIMAGETOOL_VERSION/appimagetool-x86_64.AppImage"
+  "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-x86_64.AppImage"
+echo "$APPIMAGETOOL_SHA256  $tool" | sha256sum --check --quiet
 chmod +x "$tool"
 
 # The tool is an AppImage itself, and hosted runners have no FUSE to mount it with.
