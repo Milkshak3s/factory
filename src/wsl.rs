@@ -431,18 +431,24 @@ impl ToolCheck {
     /// What stands in the way, if anything. `gh` only matters to a `full` run.
     pub fn problem(&self, distro: &str, full: bool) -> Option<String> {
         let missing: Vec<&str> = self.missing.iter().map(String::as_str).filter(|tool| full || *tool != "gh").collect();
-        let mut problems = Vec::new();
-        if !missing.is_empty() {
-            problems.push(format!(
-                "{distro} is missing {}. Install them inside the distro, on your login shell's PATH.",
-                missing.join(", ")
-            ));
-        }
+        let mut problems: Vec<String> = missing_text(distro, &missing).into_iter().collect();
         if full && !self.gh_logged_in && !missing.contains(&"gh") {
             problems.push(format!("The GitHub CLI isn't logged in inside {distro}. Run `gh auth login` there."));
         }
         (!problems.is_empty()).then(|| problems.join(" "))
     }
+
+    /// What stands in the way of a run that uses only `tools`, if anything.
+    pub fn problem_for(&self, distro: &str, tools: &[&str]) -> Option<String> {
+        let missing: Vec<&str> = self.missing.iter().map(String::as_str).filter(|tool| tools.contains(tool)).collect();
+        missing_text(distro, &missing)
+    }
+}
+
+fn missing_text(distro: &str, missing: &[&str]) -> Option<String> {
+    (!missing.is_empty()).then(|| {
+        format!("{distro} is missing {}. Install them inside the distro, on your login shell's PATH.", missing.join(", "))
+    })
 }
 
 /// Can start the distro.
@@ -462,6 +468,18 @@ pub fn require_tools(target: &WslPath, full: bool) -> Result<(), String> {
     }
     let check = check_tools(&target.distro).map_err(|error| could_not_check(&target.distro, &error))?;
     match check.problem(&target.distro, full) {
+        Some(problem) => Err(problem),
+        None => Ok(()),
+    }
+}
+
+/// The same check for a run with no agent, which needs only `tools`.
+pub fn require_only(target: &WslPath, tools: &[&str]) -> Result<(), String> {
+    if target.is_on_windows_drive() {
+        return Err(WINDOWS_DRIVE_NOTICE.to_string());
+    }
+    let check = check_tools(&target.distro).map_err(|error| could_not_check(&target.distro, &error))?;
+    match check.problem_for(&target.distro, tools) {
         Some(problem) => Err(problem),
         None => Ok(()),
     }
@@ -554,6 +572,24 @@ mod tests {
         assert!(!same_path(Path::new(r"\\wsl$\Ubuntu\home\jo\REPO"), &canonical), "Linux paths are case-sensitive");
         assert!(same_path(Path::new(r"C:\a"), Path::new(r"C:\a")));
         assert!(!same_path(Path::new(r"C:\a"), &canonical));
+    }
+
+    #[test]
+    fn a_run_with_no_agent_only_minds_the_tools_it_uses() {
+        let check = ToolCheck { missing: vec!["claude".into(), "gh".into()], gh_logged_in: false };
+        assert_eq!(check.problem_for("Ubuntu", &["make", "git"]), None);
+
+        let check = ToolCheck { missing: vec!["git".into(), "make".into(), "claude".into()], gh_logged_in: false };
+        let text = check.problem_for("Ubuntu", &["make"]).unwrap();
+        assert!(text.starts_with("Ubuntu is missing make."), "{text}");
+        let text = check.problem_for("Ubuntu", &["make", "git"]).unwrap();
+        assert!(text.starts_with("Ubuntu is missing git, make."), "{text}");
+    }
+
+    #[test]
+    fn a_run_with_no_agent_is_still_refused_on_a_windows_drive() {
+        let target = WslPath { distro: "Ubuntu".into(), linux: "/mnt/c/repo".into() };
+        assert_eq!(require_only(&target, &["make"]), Err(WINDOWS_DRIVE_NOTICE.to_string()));
     }
 
     #[test]

@@ -42,6 +42,33 @@ the wait.
 Successful runs clean up their worktree. Failed ones keep it for inspection until you discard it.
 A failure after Merge leaves the merged work on the default branch.
 
+## Running Makefile targets
+
+The row under *Run pipeline* runs a target from the project's Makefile in your checkout, and each
+command appears in the run list with its own status, live log and *Stop* button. It involves no
+agent, worktree, branch, commit or push, and it needs only `make`, plus `git` for *Pull first*. It
+works when `claude`, `gh` or `origin` are missing. These runs don't change the project's dot, which
+follows pipeline runs only.
+
+- **Finding targets:** Factory reads `GNUmakefile`, `makefile` or `Makefile` from your working tree,
+  in that order, on each refresh, without running `make`. Only rules written in that file are listed,
+  so targets from `include` and generated rules are missing. The list leaves out names containing `%`
+  or `$`, and names starting with `.` or `-`. The row is hidden if there's no Makefile.
+- **Where it runs:** in your real checkout, on whatever is checked out, including uncommitted changes.
+  A WSL project runs it inside the distro. It uses the checkout's normal build directory rather than
+  the Cargo cache that pipeline runs share.
+- **Pull first:** this checkbox is saved per project and off by default. It runs `git pull --ff-only`
+  on the checked-out branch before the target. If that fails for any reason, such as a diverged
+  branch, no upstream, a detached `HEAD`, a conflict with local edits or a network failure, the run
+  fails and `make` doesn't run. It never merges, rebases or stashes.
+- **No confirmation:** *Run* starts immediately, whatever the target is called. Only a run of the same
+  target on that project disables it, so different targets can run at once and can collide if they
+  share files. Commands get no input, so a recipe that prompts for some won't receive any.
+
+Recipes can change your working files, or anything else your user can reach. The protections in
+[What keeps agents out of the pipeline's steps](#what-keeps-agents-out-of-the-pipelines-steps) cover
+agents, and don't apply to these commands.
+
 ## How a release is produced
 
 - **With a release workflow** (`.github/workflows/release.yml` triggered by the `release` branch):

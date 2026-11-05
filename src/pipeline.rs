@@ -42,6 +42,8 @@ pub enum Stage {
     Merge,
     Release,
     Publish,
+    Pull,
+    Make,
 }
 
 impl Stage {
@@ -57,6 +59,8 @@ impl Stage {
             Stage::Merge => "Merge",
             Stage::Release => "Release",
             Stage::Publish => "Publish",
+            Stage::Pull => "Pull",
+            Stage::Make => "Make",
         }
     }
 }
@@ -96,6 +100,12 @@ pub enum RunKind {
     },
     Release { bump: Bump },
     CreateMakefile,
+    /// Runs one Makefile target in the user's own checkout, with no agent involved.
+    Make {
+        target: String,
+        /// Whether to fast-forward the checked-out branch first.
+        pull: bool,
+    },
 }
 
 impl RunKind {
@@ -104,6 +114,7 @@ impl RunKind {
             RunKind::Build { task, .. } => subject_line(task),
             RunKind::Release { bump } => format!("Release ({} bump)", bump.label()),
             RunKind::CreateMakefile => "Create Makefile".to_string(),
+            RunKind::Make { target, .. } => format!("make {target}"),
         }
     }
 }
@@ -317,6 +328,8 @@ pub fn plan_for(project: &Project, kind: &RunKind) -> Vec<Stage> {
             plan.extend([Stage::Test, Stage::Release, Stage::Publish]);
         }
         RunKind::CreateMakefile => plan.extend([Stage::Agent, Stage::Test, Stage::Commit, Stage::Merge]),
+        RunKind::Make { pull: true, .. } => return vec![Stage::Pull, Stage::Make],
+        RunKind::Make { pull: false, .. } => return vec![Stage::Make],
     }
     plan
 }
@@ -391,6 +404,7 @@ impl Run {
                 RunKind::Build { task, bump } => self.build(task, *bump),
                 RunKind::Release { bump } => self.release_only(*bump),
                 RunKind::CreateMakefile => self.create_makefile(),
+                RunKind::Make { target, pull } => self.make(target, *pull),
             }))
             .unwrap_or_else(|_| Err(Stop::Failed("the pipeline panicked".to_string())))
         });
@@ -885,6 +899,37 @@ impl Run {
         Ok(())
     }
 
+    /// Runs one target in the user's checkout. Nothing else a run does applies here: there's no
+    /// worktree, branch or agent, and the only thing it can change is what the pull and recipe do.
+    fn make(&self, target: &str, pull: bool) -> Result<(), Stop> {
+        let repo = &self.project.path;
+        if let Some(distro) = wsl::target(repo) {
+            self.set_wait(format!("Waiting for the tool check in {}", distro.distro));
+            let tools: &[&str] = if pull { &["make", "git"] } else { &["make"] };
+            wsl::require_only(&distro, tools)?;
+        }
+        let line = format!("make {target}");
+        if pull {
+            self.stage(Stage::Pull, 1, || {
+                self.git_stream(repo, &["pull", "--ff-only"]).map_err(|stop| match stop {
+                    Stop::Failed(_) => {
+                        Stop::Failed(format!("`git pull --ff-only` failed, so `{line}` didn't run. The log says why."))
+                    }
+                    other => other,
+                })
+            })?;
+        }
+        self.stage(Stage::Make, 1, || {
+            self.log(&format!("$ {line}"));
+            self.set_wait(format!("Waiting for `{line}`"));
+            if self.stream(make_target_command(repo, target), None, &mut |text| self.log(text))? {
+                Ok(())
+            } else {
+                Err(Stop::Failed(format!("`{line}` failed")))
+            }
+        })
+    }
+
     fn run_makefile_agent(&self, prompt: String, resume: Option<String>) -> Result<AgentResult, Stop> {
         let wt = &self.worktree;
         let head_before = git(wt, &["rev-parse", "HEAD"])?;
@@ -1119,6 +1164,13 @@ fn shell_stage_command(dir: &Path, line: &str, envs: &[(String, String)]) -> std
 fn make_check_command(dir: &Path) -> std::process::Command {
     let mut cmd = command("make");
     cmd.current_dir(dir).args(["-n", "test"]);
+    wsl::route(cmd)
+}
+
+/// No shell, so the target reaches make as one argument whatever it contains.
+fn make_target_command(dir: &Path, target: &str) -> std::process::Command {
+    let mut cmd = command("make");
+    cmd.current_dir(dir).arg(target);
     wsl::route(cmd)
 }
 
@@ -1601,6 +1653,266 @@ mod tests {
         let cmd = shell_stage_command(Path::new("."), "make test", &[]);
         assert_ne!(cmd.get_program(), "wsl.exe");
         assert_eq!(cmd.get_current_dir(), Some(Path::new(".")));
+    }
+
+    #[test]
+    fn a_make_target_runs_in_the_checkout_with_no_shell() {
+        let repo = Path::new("some").join("checkout");
+        let cmd = make_target_command(&repo, "fmt-check");
+        assert_eq!(cmd.get_program(), "make");
+        assert_eq!(args_of(&cmd), ["fmt-check"]);
+        assert_eq!(cmd.get_current_dir(), Some(repo.as_path()));
+        assert_eq!(cmd.get_envs().count(), 0, "in particular, no CARGO_TARGET_DIR");
+    }
+
+    #[test]
+    fn a_make_target_in_a_distro_goes_through_wsl_with_no_shell() {
+        wsl::seed_env("MakeDistro", "/seeded/bin", "/home/jo");
+        let cmd = make_target_command(Path::new(r"\\wsl.localhost\MakeDistro\home\jo\repo"), "fmt-check");
+        assert_eq!(cmd.get_program(), "wsl.exe");
+        let args = args_of(&cmd);
+        assert_eq!(args[..4], ["-d", "MakeDistro", "--cd", "/home/jo/repo"]);
+        assert_eq!(args[args.len() - 2..], ["make", "fmt-check"]);
+        for shell in ["sh", "-c", "cmd", "/C"] {
+            assert!(!args.iter().any(|arg| arg == shell), "{shell} is in {args:?}");
+        }
+        assert!(!args.iter().any(|arg| arg.starts_with("CARGO_TARGET_DIR")));
+    }
+
+    #[test]
+    fn a_make_run_plans_a_pull_only_when_asked_and_never_a_prepare() {
+        let plan = |pull| plan_for(&Project::default(), &RunKind::Make { target: "test".into(), pull });
+        assert_eq!(plan(false), [Stage::Make]);
+        assert_eq!(plan(true), [Stage::Pull, Stage::Make]);
+        let with_setup = Project { setup_command: "npm ci".into(), ..Default::default() };
+        assert_eq!(plan_for(&with_setup, &RunKind::Make { target: "test".into(), pull: false }), [Stage::Make]);
+    }
+
+    #[test]
+    fn a_make_run_is_titled_after_its_target() {
+        assert_eq!(RunKind::Make { target: "fmt-check".into(), pull: true }.title(), "make fmt-check");
+    }
+
+    /// Stands in for Claude in a make run, which must never get as far as calling one.
+    #[derive(Default)]
+    struct UncalledAgent {
+        called: std::sync::atomic::AtomicBool,
+    }
+
+    impl Agent for UncalledAgent {
+        fn run(
+            &self,
+            _request: AgentRequest,
+            _cancel: &Cancel,
+            _log: &mut dyn FnMut(&str),
+        ) -> Result<Option<AgentResult>, String> {
+            self.called.store(true, Ordering::SeqCst);
+            Err("a make run called an agent".to_string())
+        }
+    }
+
+    fn start_make(fx: &Fixture, target: &str, pull: bool) -> (RunHandle, Arc<UncalledAgent>) {
+        let agent = Arc::new(UncalledAgent::default());
+        let env = Env {
+            paths: fx.paths.clone(),
+            agent: agent.clone(),
+            forge: Arc::new(FakeForge::default()),
+            notify: Arc::new(|| {}),
+            poll_every: Duration::from_millis(1),
+        };
+        (start(fx.project.clone(), RunKind::Make { target: target.into(), pull }, env), agent)
+    }
+
+    /// The finished run and its log.
+    fn run_make(fx: &Fixture, target: &str, pull: bool) -> (RunRecord, Vec<String>) {
+        let (handle, agent) = start_make(fx, target, pull);
+        handle.thread.join().unwrap();
+        assert!(!agent.called.load(Ordering::SeqCst), "a make run called an agent");
+        let state = handle.state.lock().unwrap();
+        (state.record.clone(), state.log.clone())
+    }
+
+    /// `echo` with a redirect works under both sh and cmd.exe. `git hash-object` fails on a missing file.
+    const MAKE_FIXTURE: &str = "mark:\n\techo made> marker.txt\n\
+                                show:\n\tgit hash-object README.md\n\
+                                bad:\n\tgit hash-object missing.txt\n\
+                                pulled:\n\tgit hash-object pulled.txt\n";
+
+    /// Checks `main` out to another clone that can push to the fixture's remote.
+    fn second_clone(fx: &Fixture) -> PathBuf {
+        let other = fx.dir.path().join("other");
+        sh(fx.dir.path(), &["clone", &fx.remote.to_string_lossy(), &other.to_string_lossy()]);
+        configure(&other);
+        other
+    }
+
+    fn commit_and_push(clone: &Path, file: &str, branch: &str) {
+        fs::write(clone.join(file), "new\n").unwrap();
+        sh(clone, &["add", "."]);
+        sh(clone, &["commit", "-m", file]);
+        sh(clone, &["push", "origin", branch]);
+    }
+
+    #[test]
+    fn a_passing_target_runs_in_the_checkout_and_leaves_no_trace_of_a_pipeline() {
+        let fx = fixture_with(&[("Makefile", MAKE_FIXTURE)]);
+        let head = sh(&fx.repo, &["rev-parse", "HEAD"]);
+        let (record, log) = run_make(&fx, "mark", false);
+
+        assert_eq!(record.status, RunStatus::Succeeded, "{:?}\n{}", record.error, log.join("\n"));
+        assert_eq!(stage_names(&record), ["Make"]);
+        assert_eq!(record.plan, [Stage::Make]);
+        assert!(log.iter().any(|line| line == "$ make mark"), "{log:?}");
+        assert!(fx.repo.join("marker.txt").exists(), "ran in the checkout");
+
+        assert_eq!(record.worktree, None);
+        assert_eq!(record.branch, None);
+        assert_eq!(record.waiting_on, None);
+        assert_eq!(record.commit, None);
+        assert_eq!(record.pushed_to, None);
+        assert!(!fx.paths.data_dir.join("worktrees").exists());
+        assert_eq!(sh(&fx.repo, &["worktree", "list"]).lines().count(), 1);
+        assert_eq!(sh(&fx.repo, &["branch", "--list", "factory/*"]), "");
+        assert_eq!(sh(&fx.repo, &["rev-parse", "HEAD"]), head);
+        assert_eq!(sh(&fx.repo, &["status", "--porcelain"]), "?? marker.txt", "the clean-up left the checkout alone");
+    }
+
+    #[test]
+    fn a_recipes_output_is_logged_and_it_sees_uncommitted_changes() {
+        let fx = fixture_with(&[("Makefile", MAKE_FIXTURE)]);
+        fs::write(fx.repo.join("README.md"), "edited but not committed\n").unwrap();
+        let edited = sh(&fx.repo, &["hash-object", "README.md"]);
+
+        let (record, log) = run_make(&fx, "show", false);
+
+        assert_eq!(record.status, RunStatus::Succeeded, "{:?}", record.error);
+        assert!(log.iter().any(|line| *line == edited), "the recipe's output has the edit's hash: {log:?}");
+        assert_eq!(sh(&fx.repo, &["status", "--porcelain"]), " M README.md", "and the edit is still there");
+    }
+
+    #[test]
+    fn a_failing_target_fails_the_run() {
+        let fx = fixture_with(&[("Makefile", MAKE_FIXTURE)]);
+        let (record, log) = run_make(&fx, "bad", false);
+        assert_eq!(record.status, RunStatus::Failed);
+        assert_eq!(record.error.as_deref(), Some("`make bad` failed"));
+        assert_eq!(record.stages.last().unwrap().status, StageStatus::Failed);
+        assert!(log.iter().any(|line| line.contains("missing.txt")), "{log:?}");
+    }
+
+    #[test]
+    fn a_target_that_doesnt_exist_fails_normally() {
+        let fx = fixture_with(&[("Makefile", MAKE_FIXTURE)]);
+        let (record, _) = run_make(&fx, "gone", false);
+        assert_eq!(record.status, RunStatus::Failed);
+        assert_eq!(record.error.as_deref(), Some("`make gone` failed"));
+    }
+
+    #[test]
+    fn stopping_kills_a_running_target() {
+        let recipe = if cfg!(windows) { "slow:\n\tping -n 60 127.0.0.1\n" } else { "slow:\n\tsleep 60\n" };
+        let fx = fixture_with(&[("Makefile", recipe)]);
+        let (handle, agent) = start_make(&fx, "slow", false);
+
+        let started = Instant::now();
+        wait_until(&handle.state, "the wait", |s| {
+            s.record.waiting_on.as_ref().is_some_and(|wait| wait.label == "Waiting for `make slow`")
+        });
+        handle.cancel.cancel();
+        handle.thread.join().unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(45));
+        assert!(!agent.called.load(Ordering::SeqCst));
+        let state = handle.state.lock().unwrap();
+        assert_eq!(state.record.status, RunStatus::Cancelled);
+        assert_eq!(state.record.stages.last().unwrap().status, StageStatus::Cancelled);
+    }
+
+    #[test]
+    fn pulling_fast_forwards_the_checked_out_branch_and_leaves_the_default_branch_alone() {
+        let fx = fixture_with(&[("Makefile", MAKE_FIXTURE)]);
+        sh(&fx.repo, &["switch", "-c", "feature"]);
+        sh(&fx.repo, &["push", "-u", "origin", "feature"]);
+        let main_before = sh(&fx.repo, &["rev-parse", "main"]);
+
+        let other = second_clone(&fx);
+        commit_and_push(&other, "on-main.txt", "main");
+        sh(&other, &["switch", "feature"]);
+        commit_and_push(&other, "pulled.txt", "feature");
+
+        let (record, log) = run_make(&fx, "pulled", true);
+
+        assert_eq!(record.status, RunStatus::Succeeded, "{:?}\n{}", record.error, log.join("\n"));
+        assert_eq!(stage_names(&record), ["Pull", "Make"]);
+        assert!(log.iter().any(|line| line == "$ git pull --ff-only"), "{log:?}");
+        assert_eq!(sh(&fx.repo, &["symbolic-ref", "--short", "HEAD"]), "feature");
+        assert_eq!(sh(&fx.repo, &["rev-parse", "HEAD"]), sh(&other, &["rev-parse", "HEAD"]));
+        assert_eq!(sh(&fx.repo, &["rev-parse", "main"]), main_before);
+    }
+
+    #[test]
+    fn without_a_pull_the_remote_is_not_touched() {
+        let fx = fixture_with(&[("Makefile", MAKE_FIXTURE)]);
+        let other = second_clone(&fx);
+        commit_and_push(&other, "pulled.txt", "main");
+        let head = sh(&fx.repo, &["rev-parse", "HEAD"]);
+
+        let (record, _) = run_make(&fx, "pulled", false);
+
+        assert_eq!(record.status, RunStatus::Failed, "the pulled file isn't here");
+        assert_eq!(sh(&fx.repo, &["rev-parse", "HEAD"]), head);
+        assert!(git(&fx.repo, &["cat-file", "-e", &sh(&other, &["rev-parse", "HEAD"])]).is_err(), "not even fetched");
+    }
+
+    fn assert_stopped_at_pull(fx: &Fixture, record: &RunRecord) {
+        assert_eq!(record.status, RunStatus::Failed);
+        assert_eq!(stage_names(record), ["Pull"], "make never started");
+        assert!(record.error.as_deref().unwrap().contains("`git pull --ff-only` failed"), "{:?}", record.error);
+        assert!(record.error.as_deref().unwrap().contains("`make mark` didn't run"), "{:?}", record.error);
+        assert!(!fx.repo.join("marker.txt").exists(), "make never ran");
+    }
+
+    #[test]
+    fn a_diverged_branch_fails_at_pull_without_merging_or_running_make() {
+        let fx = fixture_with(&[("Makefile", MAKE_FIXTURE)]);
+        let other = second_clone(&fx);
+        commit_and_push(&other, "theirs.txt", "main");
+        fs::write(fx.repo.join("mine.txt"), "mine\n").unwrap();
+        sh(&fx.repo, &["add", "."]);
+        sh(&fx.repo, &["commit", "-m", "mine"]);
+        let head = sh(&fx.repo, &["rev-parse", "HEAD"]);
+
+        let (record, _) = run_make(&fx, "mark", true);
+
+        assert_stopped_at_pull(&fx, &record);
+        assert_eq!(sh(&fx.repo, &["rev-parse", "HEAD"]), head, "no merge, no rebase");
+        assert_eq!(sh(&fx.repo, &["status", "--porcelain"]), "");
+    }
+
+    #[test]
+    fn a_branch_with_no_upstream_fails_at_pull_without_running_make() {
+        let fx = fixture_with(&[("Makefile", MAKE_FIXTURE)]);
+        sh(&fx.repo, &["switch", "-c", "lonely"]);
+        let (record, _) = run_make(&fx, "mark", true);
+        assert_stopped_at_pull(&fx, &record);
+    }
+
+    #[test]
+    fn a_detached_head_fails_at_pull_without_running_make() {
+        let fx = fixture_with(&[("Makefile", MAKE_FIXTURE)]);
+        sh(&fx.repo, &["switch", "--detach"]);
+        let (record, _) = run_make(&fx, "mark", true);
+        assert_stopped_at_pull(&fx, &record);
+    }
+
+    #[test]
+    fn make_runs_load_back_from_history() {
+        let fx = fixture_with(&[("Makefile", MAKE_FIXTURE)]);
+        let (record, _) = run_make(&fx, "mark", true);
+        let loaded = load_records(&fx.paths);
+        assert_eq!(loaded[0].id, record.id);
+        assert_eq!(loaded[0].kind, RunKind::Make { target: "mark".into(), pull: true });
+        assert_eq!(loaded[0].plan, [Stage::Pull, Stage::Make]);
     }
 
     #[test]

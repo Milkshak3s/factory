@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, FixedOffset, Local};
 use eframe::egui::{self, Color32, RichText, ScrollArea, TextEdit};
 
-use crate::agent::{Agent, ClaudeCli, locate_claude};
+use crate::agent::{Agent, ClaudeCli, NoAgent, locate_claude};
 use crate::config::{self, Config, Paths, Project};
 use crate::forge::{Forge, GhCli, locate_gh};
 use crate::git::{self, RepoStatus};
@@ -178,6 +178,40 @@ fn can_create_makefile(tooling: &Tooling) -> bool {
     }
 }
 
+/// What stops any make run on this project. It needs no agent, `gh`, `origin` or tool check here,
+/// so only what can't work at all counts. A stopped distro doesn't, since starting the run wakes it.
+fn make_gate(tooling: &Tooling) -> Option<String> {
+    match tooling {
+        Tooling::Native { .. } => None,
+        Tooling::Wsl { on_windows_drive: true, .. } => Some(wsl::WINDOWS_DRIVE_NOTICE.to_string()),
+        Tooling::Wsl { distro, state: Some(state), .. } if matches!(state, DistroState::Unavailable(_)) => state.label(distro),
+        Tooling::Wsl { .. } => None,
+    }
+}
+
+/// Why *Run* is disabled for this target, given the gate and the project's runs. Commands sharing a
+/// checkout may collide, but only running the very same target twice is ruled out.
+fn make_run_blocker(gate: Option<&str>, records: &[RunRecord], target: &str) -> Option<String> {
+    if let Some(gate) = gate {
+        return Some(gate.to_string());
+    }
+    let running = records.iter().any(|record| {
+        record.status == RunStatus::Running && matches!(&record.kind, RunKind::Make { target: other, .. } if other == target)
+    });
+    running.then(|| format!("`make {target}` is already running on this project"))
+}
+
+/// The target to show: the last choice while it's still listed, then the default goal, then the first.
+fn pick_make_target(selected: Option<String>, targets: &[String], default_goal: Option<&str>) -> Option<String> {
+    let listed = |name: &&String| targets.contains(*name);
+    selected
+        .as_ref()
+        .filter(listed)
+        .or_else(|| targets.iter().find(|target| Some(target.as_str()) == default_goal))
+        .or_else(|| targets.first())
+        .cloned()
+}
+
 /// The WSL half of a status refresh. Looks at which distros are running first, so that an automatic
 /// refresh leaves a stopped one stopped. Everything it decides arrives through the channels.
 fn refresh_distros(
@@ -246,6 +280,8 @@ pub struct App {
     release_bump: Option<Bump>,
     /// The bump for a run that skips the grill. Deliberately not remembered between runs.
     build_bump: Bump,
+    /// The target picked for each project. Deliberately not saved.
+    make_selection: HashMap<PathBuf, String>,
     notice: Option<String>,
     running_last_frame: usize,
     /// Only set when running from an installed copy.
@@ -281,10 +317,12 @@ fn wait_label(record: &RunRecord) -> Option<&str> {
 }
 
 /// A project's dot and tooltip, given its runs newest first. Any run wanting an answer turns it
-/// amber, even behind a newer run. Otherwise it follows the latest run. `None` if there are no runs.
+/// amber, even behind a newer run. Otherwise it follows the latest run. Make runs don't count, so
+/// the dot stays about the pipeline. `None` if there are no pipeline runs.
 fn project_dot(records: &[RunRecord]) -> Option<(Color32, Option<String>)> {
-    let latest = records.first()?;
-    Some(match records.iter().find(|record| record.questions.is_some()) {
+    let mut pipeline_runs = records.iter().filter(|record| !matches!(record.kind, RunKind::Make { .. }));
+    let latest = pipeline_runs.clone().next()?;
+    Some(match pipeline_runs.find(|record| record.questions.is_some()) {
         Some(asking) => (AMBER, wait_label(asking).map(str::to_string)),
         None => (run_dot_color(latest), wait_label(latest).map(str::to_string)),
     })
@@ -384,6 +422,7 @@ impl App {
             selected_run: None,
             release_bump: None,
             build_bump: Bump::Patch,
+            make_selection: HashMap::new(),
             notice,
             running_last_frame: 0,
             updater,
@@ -533,6 +572,7 @@ impl App {
             None => wsl::target(&project.path).map(|_| PathBuf::from("claude")),
         };
         let agent: Arc<dyn Agent> = match program {
+            _ if matches!(kind, RunKind::Make { .. }) => Arc::new(NoAgent),
             Some(program) => Arc::new(ClaudeCli { program }),
             None => {
                 self.notice = Some("Could not find the claude binary".to_string());
@@ -566,17 +606,20 @@ impl App {
         self.runs.iter().filter(|r| r.state.lock().unwrap().record.status == RunStatus::Running).count()
     }
 
-    /// The color and tooltip for a project's dot, or `None` if it has no runs yet.
-    fn project_dot(&self, name: &str) -> Option<(Color32, Option<String>)> {
-        let records: Vec<RunRecord> = self
-            .runs
+    /// A project's runs, newest first.
+    fn project_records(&self, name: &str) -> Vec<RunRecord> {
+        self.runs
             .iter()
             .filter_map(|run| {
                 let state = run.state.lock().unwrap();
                 (state.record.project == name).then(|| state.record.clone())
             })
-            .collect();
-        project_dot(&records)
+            .collect()
+    }
+
+    /// The color and tooltip for a project's dot, or `None` if it has no pipeline runs yet.
+    fn project_dot(&self, name: &str) -> Option<(Color32, Option<String>)> {
+        project_dot(&self.project_records(name))
     }
 
     /// `<distro> is stopped`, or why WSL can't be used, if either applies.
@@ -693,6 +736,7 @@ impl App {
         let needs_makefile = known && status.has_origin && !status.has_makefile;
         let blocker = project_blocker(&project.default_branch, known, &status, &tooling);
         let makefile_enabled = can_create_makefile(&tooling);
+        let gate = make_gate(&tooling);
         if let Some(blocker) = &blocker {
             ui.colored_label(AMBER, blocker);
         }
@@ -739,6 +783,12 @@ impl App {
                 }
             });
         });
+        // A repo blocker can hide the gate's message, and the gate is what explains this row.
+        let shown_gate = gate.as_deref().filter(|_| status.has_local_makefile);
+        if let Some(gate) = shown_gate.filter(|gate| blocker.as_deref() != Some(*gate)) {
+            ui.colored_label(AMBER, gate);
+        }
+        self.make_row(ui, index, &project, &status, gate.as_deref());
 
         if self.release_bump.is_some() {
             self.release_prompt(ui, &project);
@@ -747,6 +797,45 @@ impl App {
         self.settings(ui, index);
         ui.separator();
         self.runs_view(ui, &project);
+    }
+
+    /// Picks a Makefile target and runs it in the checkout. `project_blocker` doesn't apply: only
+    /// `gate` does, because make needs none of what the pipeline does.
+    fn make_row(&mut self, ui: &mut egui::Ui, index: usize, project: &Project, status: &RepoStatus, gate: Option<&str>) {
+        if !status.has_local_makefile {
+            return;
+        }
+        let remembered = self.make_selection.get(&project.path).cloned();
+        let Some(mut selected) = pick_make_target(remembered, &status.make_targets, status.make_default_goal.as_deref()) else {
+            ui.weak("No targets found in the Makefile");
+            return;
+        };
+        let records = self.project_records(&project.name);
+        ui.horizontal(|ui| {
+            ui.label("make");
+            egui::ComboBox::from_id_salt("make_target").selected_text(selected.clone()).show_ui(ui, |ui| {
+                for target in &status.make_targets {
+                    ui.selectable_value(&mut selected, target.clone(), target.as_str());
+                }
+            });
+            let blocked = make_run_blocker(gate, &records, &selected);
+            let run = ui.add_enabled(blocked.is_none(), egui::Button::new("Run"));
+            let run = match &blocked {
+                Some(why) => run.on_disabled_hover_text(why.as_str()),
+                None => run.on_hover_text(format!("Starts `make {selected}` in your checkout right away")),
+            };
+            if run.clicked() {
+                let pull = self.config.projects[index].pull_before_make;
+                self.start_run(ui.ctx(), project.clone(), RunKind::Make { target: selected.clone(), pull });
+            }
+            let toggle = ui.checkbox(&mut self.config.projects[index].pull_before_make, "Pull first").on_hover_text(
+                "Runs `git pull --ff-only` on the checked-out branch first. If that fails, the target doesn't run.",
+            );
+            if toggle.changed() {
+                self.save_config();
+            }
+        });
+        self.make_selection.insert(project.path.clone(), selected);
     }
 
     fn release_prompt(&mut self, ui: &mut egui::Ui, project: &Project) {
@@ -827,12 +916,7 @@ impl App {
     }
 
     fn runs_view(&mut self, ui: &mut egui::Ui, project: &Project) {
-        let records: Vec<RunRecord> = self
-            .runs
-            .iter()
-            .map(|run| run.state.lock().unwrap().record.clone())
-            .filter(|record| record.project == project.name)
-            .collect();
+        let records = self.project_records(&project.name);
         if records.is_empty() {
             ui.weak("No runs yet.");
             return;
@@ -1462,5 +1546,96 @@ mod tests {
         assert_eq!(project_dot(&records), Some((GREEN, None)), "no wait, no tooltip");
 
         assert_eq!(project_dot(&[]), None);
+    }
+
+    fn make_record(target: &str, status: RunStatus, wait: Option<&str>) -> RunRecord {
+        RunRecord { kind: RunKind::Make { target: target.into(), pull: false }, ..run_record(status, false, wait) }
+    }
+
+    #[test]
+    fn make_runs_do_not_affect_a_project_dot() {
+        let records = [make_record("run", RunStatus::Running, Some("Waiting for `make run`")), run_record(RunStatus::Failed, false, None)];
+        assert_eq!(project_dot(&records), Some((RED, None)), "a long `make run` doesn't turn it blue");
+        let records = [make_record("lint", RunStatus::Failed, None), run_record(RunStatus::Succeeded, false, None)];
+        assert_eq!(project_dot(&records), Some((GREEN, None)), "a failed `make lint` doesn't turn it red");
+        let records = [make_record("run", RunStatus::Running, None), run_record(RunStatus::Running, true, Some("Your answers"))];
+        assert_eq!(project_dot(&records), Some((AMBER, Some("Your answers".to_string()))));
+    }
+
+    #[test]
+    fn a_project_with_only_make_runs_has_no_project_dot_but_each_run_keeps_its_own() {
+        let records = [make_record("test", RunStatus::Failed, None), make_record("run", RunStatus::Running, Some("Waiting"))];
+        assert_eq!(project_dot(&records), None);
+        assert_eq!(run_dot_color(&records[0]), RED);
+        assert_eq!(run_dot_color(&records[1]), BLUE);
+    }
+
+    #[test]
+    fn make_runs_do_not_need_claude_gh_or_anything_about_the_repo() {
+        let logged_out = Err("HTTP 401".to_string());
+        assert_eq!(make_gate(&native(false, None)), None);
+        assert_eq!(make_gate(&native(false, Some(&logged_out))), None);
+
+        // The pipeline is blocked in each of these, and make still isn't.
+        let tooling = native(false, Some(&logged_out));
+        assert!(blocker(&tooling).is_some());
+        assert_eq!(make_run_blocker(make_gate(&tooling).as_deref(), &[], "test"), None);
+
+        let available = DistroState::Available;
+        let no_tools = Ok(ToolCheck { missing: vec!["claude".into(), "gh".into()], gh_logged_in: false });
+        let tooling = in_ubuntu(Some(&available), Some(&no_tools));
+        assert!(blocker(&tooling).is_some());
+        assert_eq!(make_gate(&tooling), None);
+    }
+
+    #[test]
+    fn only_a_windows_drive_or_unavailable_wsl_gates_make_and_a_stopped_distro_does_not() {
+        let stopped = DistroState::Stopped;
+        assert_eq!(make_gate(&in_ubuntu(Some(&stopped), None)), None);
+        assert_eq!(make_gate(&in_ubuntu(None, None)), None);
+
+        let unavailable = DistroState::Unavailable("not installed".into());
+        let tooling = in_ubuntu(Some(&unavailable), None);
+        assert_eq!(make_gate(&tooling), blocker(&tooling), "the existing message");
+
+        let tooling = Tooling::Wsl { distro: "Ubuntu", on_windows_drive: true, state: None, tools: None };
+        assert_eq!(make_gate(&tooling).as_deref(), Some(wsl::WINDOWS_DRIVE_NOTICE));
+        assert_eq!(make_run_blocker(Some(wsl::WINDOWS_DRIVE_NOTICE), &[], "test").as_deref(), Some(wsl::WINDOWS_DRIVE_NOTICE));
+    }
+
+    #[test]
+    fn only_the_same_target_running_disables_run() {
+        let records = [
+            make_record("run", RunStatus::Running, None),
+            make_record("test", RunStatus::Failed, None),
+            make_record("lint", RunStatus::Interrupted, None),
+            run_record(RunStatus::Running, false, None),
+        ];
+        let why = make_run_blocker(None, &records, "run").unwrap();
+        assert!(why.contains("`make run`"), "{why}");
+        assert_eq!(make_run_blocker(None, &records, "test"), None, "a different target, finished before");
+        assert_eq!(make_run_blocker(None, &records, "lint"), None);
+        assert_eq!(make_run_blocker(None, &records, "other"), None, "a pipeline run blocks nothing");
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    #[test]
+    fn the_selected_target_starts_on_the_default_goal_or_else_the_first() {
+        let targets = names(&["one", "two"]);
+        assert_eq!(pick_make_target(None, &targets, Some("two")).as_deref(), Some("two"));
+        assert_eq!(pick_make_target(None, &targets, Some("gone")).as_deref(), Some("one"));
+        assert_eq!(pick_make_target(None, &targets, None).as_deref(), Some("one"));
+        assert_eq!(pick_make_target(None, &[], Some("two")), None);
+    }
+
+    #[test]
+    fn a_selected_target_stays_until_it_disappears_and_then_falls_back_the_same_way() {
+        let targets = names(&["one", "two", "three"]);
+        assert_eq!(pick_make_target(Some("three".into()), &targets, Some("two")).as_deref(), Some("three"));
+        assert_eq!(pick_make_target(Some("gone".into()), &targets, Some("two")).as_deref(), Some("two"));
+        assert_eq!(pick_make_target(Some("gone".into()), &targets, None).as_deref(), Some("one"));
     }
 }

@@ -181,6 +181,20 @@ impl ClaudeCli {
     }
 }
 
+/// For a run that never calls an agent, so it can start without the `claude` binary.
+pub struct NoAgent;
+
+impl Agent for NoAgent {
+    fn run(
+        &self,
+        _request: AgentRequest,
+        _cancel: &Cancel,
+        _log: &mut dyn FnMut(&str),
+    ) -> Result<Option<AgentResult>, String> {
+        Err("This run doesn't use an agent".to_string())
+    }
+}
+
 impl Agent for ClaudeCli {
     /// Returns `Ok(None)` if cancelled.
     fn run(

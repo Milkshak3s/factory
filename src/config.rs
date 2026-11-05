@@ -25,6 +25,8 @@ pub struct Project {
     pub max_attempts: u32,
     /// Whether *Run pipeline* starts with the grill. Remembered from the last choice made for this project.
     pub grill: bool,
+    /// Whether a make run starts with `git pull --ff-only`. Remembered from the last choice made for this project.
+    pub pull_before_make: bool,
 }
 
 impl Default for Project {
@@ -40,6 +42,7 @@ impl Default for Project {
             allowed_tools: String::new(),
             max_attempts: 3,
             grill: true,
+            pull_before_make: false,
         }
     }
 }
@@ -215,6 +218,22 @@ mod tests {
         config.save(&file).unwrap();
         assert!(fs::read_to_string(&file).unwrap().contains("grill = false"));
         assert!(!Config::load(&file).unwrap().projects[0].grill);
+    }
+
+    #[test]
+    fn pull_before_make_defaults_to_off_and_turning_it_on_is_remembered() {
+        assert!(!Project::default().pull_before_make);
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        fs::write(&file, "[[projects]]\nname = \"x\"\n").unwrap();
+        let mut config = Config::load(&file).unwrap();
+        assert!(!config.projects[0].pull_before_make, "projects saved before the setting existed don't pull");
+
+        config.projects[0].pull_before_make = true;
+        config.save(&file).unwrap();
+        assert!(fs::read_to_string(&file).unwrap().contains("pull_before_make = true"));
+        assert!(Config::load(&file).unwrap().projects[0].pull_before_make);
     }
 
     #[test]

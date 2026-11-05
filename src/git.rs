@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use crate::makefile;
 use crate::proc::command;
 use crate::wsl;
 
@@ -54,6 +55,11 @@ pub struct RepoStatus {
     pub has_origin: bool,
     /// Whether the branch runs start from has a Makefile, which is what the gate needs.
     pub has_makefile: bool,
+    /// Whether the checkout on disk has a Makefile, which is what *Run* needs.
+    pub has_local_makefile: bool,
+    /// The targets listed in the checkout's Makefile.
+    pub make_targets: Vec<String>,
+    pub make_default_goal: Option<String>,
     pub error: Option<String>,
 }
 
@@ -72,6 +78,12 @@ pub fn status(dir: &Path, default_branch: &str) -> RepoStatus {
     status.latest_tag = latest_tag(dir);
     status.has_origin = origin_url(dir).is_some();
     status.has_makefile = git(dir, &["cat-file", "-e", &format!("origin/{default_branch}:Makefile")]).is_ok();
+    if let Some(text) = makefile::read(dir) {
+        let parsed = makefile::parse(&text);
+        status.has_local_makefile = true;
+        status.make_targets = parsed.targets;
+        status.make_default_goal = parsed.default_goal;
+    }
     status
 }
 
@@ -116,6 +128,29 @@ mod tests {
         let native = git_cmd(Path::new("."), &["status"]);
         assert_eq!(native.get_program(), "git");
         assert_eq!(native.get_current_dir(), Some(Path::new(".")));
+    }
+
+    #[test]
+    fn status_reads_targets_from_the_working_tree_rather_than_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-b", "main"]).unwrap();
+
+        let empty = status(dir.path(), "main");
+        assert!(!empty.has_local_makefile);
+        assert!(empty.make_targets.is_empty());
+
+        // Never committed, so it's only on disk.
+        std::fs::write(dir.path().join("Makefile"), ".DEFAULT_GOAL := two\none:\ntwo:\n").unwrap();
+        let found = status(dir.path(), "main");
+        assert!(found.has_local_makefile);
+        assert!(!found.has_makefile, "this one still means origin's");
+        assert_eq!(found.make_targets, ["one", "two"]);
+        assert_eq!(found.make_default_goal.as_deref(), Some("two"));
+
+        std::fs::write(dir.path().join("Makefile"), "# nothing to list\n").unwrap();
+        let none = status(dir.path(), "main");
+        assert!(none.has_local_makefile);
+        assert!(none.make_targets.is_empty());
     }
 
     #[test]

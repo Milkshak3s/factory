@@ -8,6 +8,7 @@ mod git;
 // The encoders are only used by build.rs, which compiles this file too.
 #[allow(dead_code)]
 mod icon;
+mod makefile;
 mod pipeline;
 mod proc;
 mod update;
